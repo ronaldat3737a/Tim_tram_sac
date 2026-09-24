@@ -7,4 +7,5 @@ node_modules/
 models/**/*.zip
 results/
 data/
+cache/
 .env

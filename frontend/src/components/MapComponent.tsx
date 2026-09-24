@@ -3,7 +3,7 @@
 import "leaflet/dist/leaflet.css";
 import L, { type LatLngTuple } from "leaflet";
 import { Car, ParkingSquare, Zap } from "lucide-react";
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { CircleMarker, MapContainer, Marker, Polyline, TileLayer, Tooltip } from "react-leaflet";
 import type { MyCarPreviewResponse, NetworkInfo, StationUpdate, VehicleUpdate } from "@/lib/types";
@@ -43,17 +43,15 @@ const VEHICLE_COLORS: Record<VehicleUpdate["state"], string> = {
 const EV_HALO_COLOR = "#39ff14";
 const MY_CAR_RING_COLOR = "#facc15"; // gold ring: the one designated "my car"
 
-// A station/depot is offset a small, fixed distance from its road node so
-// it reads as a lot beside the street rather than sitting on top of the
-// road. Vehicles queued/charging at a station are then clustered around
-// that SAME offset point (not the raw road node) so they visually belong
-// to the station lot instead of appearing to wait mid-road; a COMPLETED
-// vehicle is clustered around its own real (already-at-the-depot-node)
-// position for the same reason. All offsets are deterministic (derived
-// from id via golden-angle spacing), so they are stable across renders
-// instead of jittering.
-const STATION_OFFSET_DEGREES = 0.00018;
-const DEPOT_OFFSET_DEGREES = 0.00018;
+// A station/depot's own POI node (network_graph.py's _add_poi_nodes) is a
+// real graph node with a real (x, y) beside the road -- the frontend reads
+// it straight from NetworkInfo.nodes, the same way as any other node
+// (section 39: never invents a position itself). Once an EV has actually
+// arrived (WAITING/CHARGING/COMPLETED), vehicle.x/y IS that exact POI
+// position too, so multiple vehicles at the same station/depot would
+// otherwise render as one overlapping icon -- this small additional
+// per-vehicle spread is the one thing that stays a purely cosmetic,
+// frontend-only, deterministic (golden-angle) computation.
 const CHARGING_CLUSTER_RADIUS_DEGREES = 0.00006;
 const QUEUE_CLUSTER_RADIUS_DEGREES = 0.00015;
 const PARKED_CLUSTER_RADIUS_DEGREES = 0.00012;
@@ -173,8 +171,22 @@ const DEPOT_ICON = L.divIcon({
   iconAnchor: [15, 15],
 });
 
-// --- Traffic color (static traffic_weight, section: Phase 0 D.2 -- traffic
-// stays static per episode; only visualized here, physics unchanged) -------
+// --- Edge styling --------------------------------------------------------
+// Task 4: three visually distinct layers prove, by eye, that vehicles/
+// stations/depots stick exactly to the graph's real geometry:
+//   1. MUTED_ROAD_* -- every real road edge, drawn faint underneath
+//      everything else -- "the ground truth network".
+//   2. Traffic-colored road edges on top of that -- the same edges,
+//      colored by congestion.
+//   3. Spur edges (a station/depot's short connector to its access node)
+//      drawn in a third, distinct, fixed color -- visibly branching off
+//      the muted road layer rather than being part of the road itself.
+
+const MUTED_ROAD_COLOR = "#9ca3af";
+const MUTED_ROAD_OPACITY = 0.4;
+const MUTED_ROAD_WEIGHT = 6;
+const STATION_SPUR_COLOR = "#ea580c";
+const DEPOT_SPUR_COLOR = "#334155";
 
 function trafficColor(weight: number, maxWeight: number): string {
   const ratio = maxWeight > 0 ? Math.min(Math.max(weight / maxWeight, 0), 1) : 0;
@@ -330,61 +342,48 @@ export default function MapComponent({
     return new Map(network.nodes.map((node) => [node.id, node]));
   }, [network]);
 
-  // Backend-provided road geometry per edge (network_graph.py's `geometry`)
-  // -- the real street curve, and exactly what vehicles actually move
-  // along, so this is the single source of truth for both the drawn road
-  // and vehicle movement; the two can never visually diverge. Keyed the
-  // same way network.edges is, so lookups stay consistent even if some
-  // edge is skipped -- a plain filtered array would let its indices drift
-  // out of sync with network.edges once that happens. Already [lat, lng]
-  // pairs from the API.
-  const edgeGeometryPositions = useMemo(() => {
-    const map = new Map<string, LatLngTuple[]>();
-    if (!network) return map;
+  // A station/depot's POI node id -- used to tell a real road edge apart
+  // from a spur edge (one endpoint is a POI node) with no backend change
+  // needed, since network.stations/depots already give us node_id.
+  const stationPoiNodeIds = useMemo(
+    () => new Set(network?.stations.map((s) => s.node_id) ?? []),
+    [network],
+  );
+  const depotPoiNodeIds = useMemo(() => new Set(network?.depots.map((d) => d.node_id) ?? []), [network]);
+
+  // Backend-provided geometry per edge (network_graph.py's `geometry`, a
+  // real shapely LineString under the hood) -- the exact path vehicles
+  // move along, split into "real road" vs "spur" so each can get its own
+  // layer/styling (Task 4). Keyed the same way network.edges is, so
+  // lookups stay consistent even if some edge is skipped -- a plain
+  // filtered array would let its indices drift out of sync with
+  // network.edges once that happens. Already [lat, lng] pairs from the API.
+  const { roadEdgePositions, stationSpurPositions, depotSpurPositions } = useMemo(() => {
+    const road = new Map<string, LatLngTuple[]>();
+    const stationSpur = new Map<string, LatLngTuple[]>();
+    const depotSpur = new Map<string, LatLngTuple[]>();
+    if (!network) return { roadEdgePositions: road, stationSpurPositions: stationSpur, depotSpurPositions: depotSpur };
+
     for (const edge of network.edges) {
       if (edge.geometry.length < 2) continue;
-      map.set(
-        edgeKey(edge.source, edge.target),
-        edge.geometry.map(([lat, lng]) => [lat, lng] as LatLngTuple),
-      );
+      const key = edgeKey(edge.source, edge.target);
+      const positions = edge.geometry.map(([lat, lng]) => [lat, lng] as LatLngTuple);
+      const isStationSpur = stationPoiNodeIds.has(edge.source) || stationPoiNodeIds.has(edge.target);
+      const isDepotSpur = depotPoiNodeIds.has(edge.source) || depotPoiNodeIds.has(edge.target);
+      if (isStationSpur) stationSpur.set(key, positions);
+      else if (isDepotSpur) depotSpur.set(key, positions);
+      else road.set(key, positions);
     }
-    return map;
-  }, [network]);
+    return { roadEdgePositions: road, stationSpurPositions: stationSpur, depotSpurPositions: depotSpur };
+  }, [network, stationPoiNodeIds, depotPoiNodeIds]);
 
-  const fakeTraffic = useFakeTraffic(useMemo(() => [...edgeGeometryPositions.values()], [edgeGeometryPositions]));
+  const fakeTraffic = useFakeTraffic(useMemo(() => [...roadEdgePositions.values()], [roadEdgePositions]));
   const { isFading, isHidden } = useCompletedVehicleFade(vehicles);
 
   const maxTrafficWeight = useMemo(() => {
     if (!network || network.edges.length === 0) return 1;
     return Math.max(...network.edges.map((e) => e.traffic_weight), 0.0001);
   }, [network]);
-
-  const stationOffsetPositions = useMemo(() => {
-    const map = new Map<number, LatLngTuple>();
-    if (!network) return map;
-    for (const station of network.stations) {
-      const node = nodeById.get(station.node_id);
-      if (!node) continue;
-      const [dLat, dLng] = goldenAngleOffset(station.id, STATION_OFFSET_DEGREES);
-      map.set(station.id, [node.y + dLat, node.x + dLng]);
-    }
-    return map;
-  }, [network, nodeById]);
-
-  const depotOffsetPositions = useMemo(() => {
-    const map = new Map<number, LatLngTuple>();
-    if (!network) return map;
-    for (const depot of network.depots) {
-      const node = nodeById.get(depot.node_id);
-      if (!node) continue;
-      // Offset in the opposite angular "family" from stations (id + a large
-      // fixed jump) purely so a depot sharing a node with a station doesn't
-      // land on the exact same offset point.
-      const [dLat, dLng] = goldenAngleOffset(depot.id + 1000, DEPOT_OFFSET_DEGREES);
-      map.set(depot.id, [node.y + dLat, node.x + dLng]);
-    }
-    return map;
-  }, [network, nodeById]);
 
   const center = useMemo<LatLngTuple>(() => {
     if (!network || network.nodes.length === 0) return FALLBACK_CENTER;
@@ -402,37 +401,52 @@ export default function MapComponent({
   }
 
   function displayPositionFor(vehicle: VehicleUpdate): LatLngTuple {
+    const [lat, lng] = toLatLng(vehicle.x, vehicle.y);
+    // Once actually arrived, vehicle.x/y already IS the station/depot POI
+    // node's own real position (a real graph node reached via a real spur
+    // edge -- see network_graph.py's _add_poi_nodes) -- only a small
+    // per-vehicle spread is added on top so several cars at the same spot
+    // don't render as one overlapping icon.
     if (vehicle.state === "COMPLETED") {
-      // Once COMPLETED, vehicle.x/y IS already the real depot node's own
-      // position (the simulator set current_node to it on arrival) -- only
-      // a small per-vehicle offset is added so multiple cars parked at the
-      // same depot don't render as one overlapping icon.
       const [dLat, dLng] = goldenAngleOffset(vehicle.id, PARKED_CLUSTER_RADIUS_DEGREES);
-      const [lat, lng] = toLatLng(vehicle.x, vehicle.y);
       return [lat + dLat, lng + dLng];
     }
-    if (vehicle.station_id !== null && (vehicle.state === "WAITING" || vehicle.state === "CHARGING")) {
-      const stationPos = stationOffsetPositions.get(vehicle.station_id);
-      if (stationPos) {
-        const radius =
-          vehicle.state === "CHARGING" ? CHARGING_CLUSTER_RADIUS_DEGREES : QUEUE_CLUSTER_RADIUS_DEGREES;
-        const [dLat, dLng] = goldenAngleOffset(vehicle.id, radius);
-        return [stationPos[0] + dLat, stationPos[1] + dLng];
-      }
+    if (vehicle.state === "WAITING" || vehicle.state === "CHARGING") {
+      const radius = vehicle.state === "CHARGING" ? CHARGING_CLUSTER_RADIUS_DEGREES : QUEUE_CLUSTER_RADIUS_DEGREES;
+      const [dLat, dLng] = goldenAngleOffset(vehicle.id, radius);
+      return [lat + dLat, lng + dLng];
     }
     // TRAVELING and RETURNING_TO_DEPOT both render at the real, actively
-    // moving position the backend reports (interpolated along real road
-    // geometry) -- no offset, since they're genuinely in motion.
-    return toLatLng(vehicle.x, vehicle.y);
+    // moving position the backend reports -- no offset, since they're
+    // genuinely in motion (this also covers a vehicle crawling along a
+    // spur edge into or out of a station/depot).
+    return [lat, lng];
   }
 
   return (
     <MapContainer center={center} zoom={DEFAULT_ZOOM} className="h-full w-full rounded-lg">
       <TileLayer url={TILE_URL} attribution={TILE_ATTRIBUTION} />
 
+      {/* Z-order 1 (bottom): muted dashed underlay over every real road
+          edge -- the "ground truth" geometry vehicles/stations/depots all
+          visibly stick to. */}
+      {[...roadEdgePositions.entries()].map(([key, positions]) => (
+        <Polyline
+          key={`road-muted-${key}`}
+          positions={positions}
+          pathOptions={{
+            color: MUTED_ROAD_COLOR,
+            opacity: MUTED_ROAD_OPACITY,
+            weight: MUTED_ROAD_WEIGHT,
+            dashArray: "2 8",
+          }}
+        />
+      ))}
+
+      {/* Z-order 2: the same road edges, colored by traffic congestion. */}
       {network.edges.map((edge) => {
         const key = edgeKey(edge.source, edge.target);
-        const positions = edgeGeometryPositions.get(key);
+        const positions = roadEdgePositions.get(key);
         if (!positions) return null;
         return (
           <Polyline
@@ -447,17 +461,6 @@ export default function MapComponent({
         );
       })}
 
-      {network.nodes
-        .filter((node) => !node.is_station)
-        .map((node) => (
-          <CircleMarker
-            key={`node-${node.id}`}
-            center={toLatLng(node.x, node.y)}
-            radius={2.5}
-            pathOptions={{ color: "#64748b", fillColor: "#64748b", fillOpacity: 1, weight: 0 }}
-          />
-        ))}
-
       {fakeTraffic.map((car) => (
         <CircleMarker
           key={`fake-traffic-${car.id}`}
@@ -467,52 +470,23 @@ export default function MapComponent({
         />
       ))}
 
-      {network.depots.map((depot) => {
-        const node = nodeById.get(depot.node_id);
-        const offsetPosition = depotOffsetPositions.get(depot.id);
-        if (!node || !offsetPosition) return null;
-        return (
-          <Fragment key={`depot-group-${depot.id}`}>
-            <Polyline
-              positions={[toLatLng(node.x, node.y), offsetPosition]}
-              pathOptions={{ color: "#334155", weight: 1.5, dashArray: "3 4", opacity: 0.8 }}
-            />
-            <Marker position={offsetPosition} icon={DEPOT_ICON}>
-              <Tooltip direction="top" offset={[0, -16]}>
-                Depot {depot.id} — bãi đỗ xe sau khi sạc xong
-              </Tooltip>
-            </Marker>
-          </Fragment>
-        );
-      })}
-
-      {network.stations.map((station) => {
-        const node = nodeById.get(station.node_id);
-        const offsetPosition = stationOffsetPositions.get(station.id);
-        if (!node || !offsetPosition) return null;
-        const live = stationById.get(station.id);
-        return (
-          <Fragment key={`station-group-${station.id}`}>
-            <Polyline
-              positions={[toLatLng(node.x, node.y), offsetPosition]}
-              pathOptions={{ color: "#ea580c", weight: 1.5, dashArray: "3 4", opacity: 0.8 }}
-            />
-            <Marker
-              position={offsetPosition}
-              icon={STATION_ICON}
-              eventHandlers={{
-                mouseover: () => onStationSelect(station.id),
-                click: () => onStationSelect(station.id),
-              }}
-            >
-              <Tooltip direction="top" offset={[0, -14]}>
-                Station {station.id} — queue {live?.queue ?? 0}, charging{" "}
-                {live?.charging ?? 0}/{station.num_chargers}
-              </Tooltip>
-            </Marker>
-          </Fragment>
-        );
-      })}
+      {/* Z-order 3: spur edges -- a station/depot's short, distinctly
+          colored connector branching off the road, visibly separate from
+          both the muted underlay and the traffic layer. */}
+      {[...stationSpurPositions.entries()].map(([key, positions]) => (
+        <Polyline
+          key={`station-spur-${key}`}
+          positions={positions}
+          pathOptions={{ color: STATION_SPUR_COLOR, weight: 3, opacity: 0.9 }}
+        />
+      ))}
+      {[...depotSpurPositions.entries()].map(([key, positions]) => (
+        <Polyline
+          key={`depot-spur-${key}`}
+          positions={positions}
+          pathOptions={{ color: DEPOT_SPUR_COLOR, weight: 3, opacity: 0.9 }}
+        />
+      ))}
 
       {myCarPreview && (
         <Polyline
@@ -521,6 +495,46 @@ export default function MapComponent({
         />
       )}
 
+      {/* Z-order 4: station/depot icons (Leaflet's markerPane always
+          renders above its overlayPane, i.e. above every Polyline/
+          CircleMarker regardless of JSX order -- these still come before
+          the vehicle markers below so a vehicle icon wins any direct
+          overlap). */}
+      {network.depots.map((depot) => {
+        const node = nodeById.get(depot.node_id);
+        if (!node) return null;
+        return (
+          <Marker key={`depot-${depot.id}`} position={toLatLng(node.x, node.y)} icon={DEPOT_ICON}>
+            <Tooltip direction="top" offset={[0, -16]}>
+              Depot {depot.id} — bãi đỗ xe sau khi sạc xong
+            </Tooltip>
+          </Marker>
+        );
+      })}
+
+      {network.stations.map((station) => {
+        const node = nodeById.get(station.node_id);
+        if (!node) return null;
+        const live = stationById.get(station.id);
+        return (
+          <Marker
+            key={`station-${station.id}`}
+            position={toLatLng(node.x, node.y)}
+            icon={STATION_ICON}
+            eventHandlers={{
+              mouseover: () => onStationSelect(station.id),
+              click: () => onStationSelect(station.id),
+            }}
+          >
+            <Tooltip direction="top" offset={[0, -14]}>
+              Station {station.id} — queue {live?.queue ?? 0}, charging{" "}
+              {live?.charging ?? 0}/{station.num_chargers}
+            </Tooltip>
+          </Marker>
+        );
+      })}
+
+      {/* Z-order 5 (top): vehicles. */}
       {vehicles
         .filter((vehicle) => !isHidden(vehicle))
         .map((vehicle) => {

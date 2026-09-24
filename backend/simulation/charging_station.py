@@ -9,6 +9,10 @@ from dataclasses import dataclass, field
 @dataclass
 class ChargingStation:
     station_id: int
+    # The station's own POI node id -- both the routing target and the
+    # display position (its (x, y) on the graph is the offset point beside
+    # the road; see network_graph.py's _add_poi_nodes). Not a real traffic
+    # node itself: it connects to one via a short spur edge.
     node_id: int
     capacity: int
     num_chargers: int

@@ -41,7 +41,12 @@ export interface EdgeInfo {
 
 export interface StationInfo {
   id: number;
+  // The station's own POI node id -- both the routing target and its
+  // (x, y) display position (look it up in NetworkInfo.nodes). Not a real
+  // traffic node itself: connects to one via a short spur edge.
   node_id: number;
+  // The real traffic node that spur edge connects to.
+  access_node_id: number;
   capacity: number;
   num_chargers: number;
 }
@@ -49,6 +54,7 @@ export interface StationInfo {
 export interface DepotInfo {
   id: number;
   node_id: number;
+  access_node_id: number;
 }
 
 export interface NetworkInfo {

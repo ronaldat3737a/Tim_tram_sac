@@ -21,12 +21,13 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from shapely.geometry import LineString
 from stable_baselines3 import DQN
 
 from backend.ai_core.ev_env import EVEnv
 from backend.baseline import least_queue, nearest_station, shortest_time
 from backend.config import SimulationConfig
-from backend.simulation.network_graph import shortest_path
+from backend.simulation.network_graph import get_depot_access_nodes, get_station_access_nodes, shortest_path
 from backend.simulation.simulator import Simulator
 from backend.simulation.vehicle import VehicleState
 
@@ -34,46 +35,41 @@ IDLE_POLL_INTERVAL = 0.1
 DEFAULT_TICK_DELAY = 0.2
 DQN_MODEL_PATH = Path("models/dqn_ev_dispatch.zip")
 
+# Task 4 of the access-node/real-map refactor: RL is temporarily frozen out
+# while the new map/POI physics are validated against baselines only. Any
+# "dqn" request is silently downgraded to this baseline instead of loading/
+# running the (pre-refactor-trained, now stale) model -- remove this once
+# DQN is retrained against the new graph and re-validated.
+RL_TEMPORARILY_DISABLED = True
+FALLBACK_ALGORITHM_WHILE_RL_DISABLED = "nearest_station"
+
 _BASELINE_POLICIES = {
     "nearest_station": nearest_station.choose_station,
     "shortest_time": shortest_time.choose_station,
     "least_queue": least_queue.choose_station,
 }
 
-def _point_along_geometry(geometry: list[list[float]], fraction: float) -> tuple[float, float]:
-    """Interpolate a point at `fraction` (0..1) of the way along a polyline,
-    by cumulative segment length rather than just point index, so movement
-    along a curvy real road stays at a visually uniform speed (Task 2 of the
-    OSM upgrade: follow the real road curve, not a straight A-to-B line)."""
+def _point_along_geometry(line: LineString, fraction: float) -> tuple[float, float]:
+    """A point at `fraction` (0..1) of the way along a real edge's
+    LineString, guaranteed to lie exactly on it (Task 1 of the spatial-
+    geometry refactor: an EV's displayed position is always a shapely
+    `Point` produced by `LineString.interpolate()`, never a hand-rolled
+    approximation), so movement along a curvy real road stays at a visually
+    uniform speed."""
     fraction = min(max(fraction, 0.0), 1.0)
-    segment_lengths = [
-        ((geometry[i + 1][0] - geometry[i][0]) ** 2 + (geometry[i + 1][1] - geometry[i][1]) ** 2) ** 0.5
-        for i in range(len(geometry) - 1)
-    ]
-    total_length = sum(segment_lengths)
-    if total_length <= 0.0:
-        return tuple(geometry[0])
-
-    target = fraction * total_length
-    covered = 0.0
-    for i, seg_len in enumerate(segment_lengths):
-        if covered + seg_len >= target or i == len(segment_lengths) - 1:
-            seg_fraction = 0.0 if seg_len <= 0 else (target - covered) / seg_len
-            x0, y0 = geometry[i]
-            x1, y1 = geometry[i + 1]
-            return x0 + (x1 - x0) * seg_fraction, y0 + (y1 - y0) * seg_fraction
-        covered += seg_len
-    return tuple(geometry[-1])
+    point = line.interpolate(fraction, normalized=True)
+    return point.x, point.y
 
 
 def _interpolate_position(simulator: Simulator, vehicle) -> tuple[float, float]:
     """Returns this vehicle's current (lng, lat) for display. The
     authoritative physics (edge_progress, distance, battery consumption,
     reward -- all in simulator.py) stay untouched scalars; this only decides
-    where that scalar progress maps to visually, along the edge's real
-    `geometry` polyline instead of a straight node-to-node line. Node (x, y)
-    are always already real (lng, lat) (section 11: the graph is always a
-    real OpenStreetMap street network), so no further transform is needed."""
+    where that scalar progress maps to visually. A station/depot's POI is a
+    real graph node reached via a real spur edge (network_graph.py's
+    _add_poi_nodes), so the normal edge-geometry interpolation below already
+    shows an EV smoothly crawling in and back out -- no special-casing by
+    vehicle state is needed at all."""
     graph = simulator.graph
     if len(vehicle.route) >= 2:
         u, v = vehicle.route[0], vehicle.route[1]
@@ -84,8 +80,8 @@ def _interpolate_position(simulator: Simulator, vehicle) -> tuple[float, float]:
         # opposite direction from how it was stored, walk the polyline
         # backwards so position still advances the way the vehicle is
         # actually moving.
-        geometry = edge["geometry"] if edge["geometry_start"] == u else list(reversed(edge["geometry"]))
-        return _point_along_geometry(geometry, fraction)
+        line = edge["geometry"] if edge["geometry_start"] == u else edge["geometry"].reverse()
+        return _point_along_geometry(line, fraction)
     node = graph.nodes[vehicle.current_node]
     return node["x"], node["y"]
 
@@ -218,6 +214,8 @@ class SimulationManager:
     # --- control (called from REST request handlers) -------------------
 
     def request_start(self, seed: int | None, algorithm: str, speed: float) -> None:
+        if RL_TEMPORARILY_DISABLED and algorithm == "dqn":
+            algorithm = FALLBACK_ALGORITHM_WHILE_RL_DISABLED
         if algorithm == "dqn":
             # Deserializing the model from disk can take a noticeable
             # fraction of a second; doing it while holding self._lock would
@@ -319,23 +317,28 @@ class SimulationManager:
                     "geometry": [
                         [y, x]
                         for x, y in (
-                            data["geometry"] if data["geometry_start"] == u else reversed(data["geometry"])
+                            list(data["geometry"].coords)
+                            if data["geometry_start"] == u
+                            else reversed(list(data["geometry"].coords))
                         )
                     ],
                 }
                 for u, v, data in graph.edges(data=True)
             ]
+            station_access_nodes = get_station_access_nodes(graph)
             stations = [
                 {
                     "id": station.station_id,
                     "node_id": station.node_id,
+                    "access_node_id": station_access_nodes[station.station_id],
                     "capacity": station.capacity,
                     "num_chargers": station.num_chargers,
                 }
                 for station in self.env.simulator.stations.values()
             ]
+            depot_access_nodes = get_depot_access_nodes(graph)
             depots = [
-                {"id": depot_index, "node_id": node_id}
+                {"id": depot_index, "node_id": node_id, "access_node_id": depot_access_nodes[depot_index]}
                 for depot_index, node_id in enumerate(self.env.simulator.depot_nodes)
             ]
             return {
@@ -367,16 +370,23 @@ class SimulationManager:
                     f"my car (vehicle {self.my_vehicle_id}) has no preview available "
                     f"right now (state={state_name})"
                 )
-            if self.algorithm == "dqn":
-                if self._dqn_model is None:
-                    raise RuntimeError("dqn model is not loaded")
-                obs = self.env.build_observation(self.my_vehicle_id)
-                action, _ = self._dqn_model.predict(obs, deterministic=True)
-                candidate_station_id = int(action)
+            if self.algorithm == "dqn" and not RL_TEMPORARILY_DISABLED:
+                try:
+                    if self._dqn_model is None:
+                        raise RuntimeError("dqn model is not loaded")
+                    obs = self.env.build_observation(self.my_vehicle_id)
+                    action, _ = self._dqn_model.predict(obs, deterministic=True)
+                    candidate_station_id = int(action)
+                except Exception:
+                    # Task 4: never let a DQN failure surface as a crashed
+                    # request -- fall back to a baseline for this preview.
+                    candidate_station_id = _BASELINE_POLICIES[FALLBACK_ALGORITHM_WHILE_RL_DISABLED](
+                        simulator, self.my_vehicle_id
+                    )
             else:
-                candidate_station_id = _BASELINE_POLICIES[self.algorithm](
-                    simulator, self.my_vehicle_id
-                )
+                candidate_station_id = _BASELINE_POLICIES[
+                    self.algorithm if self.algorithm in _BASELINE_POLICIES else FALLBACK_ALGORITHM_WHILE_RL_DISABLED
+                ](simulator, self.my_vehicle_id)
 
             station = simulator.stations[candidate_station_id]
             path, _, _ = shortest_path(
@@ -385,6 +395,8 @@ class SimulationManager:
                 station.node_id,
                 weight=self.config.routing_weight,
             )
+            # path already ends at the station's own POI node (a real graph
+            # node, reached via its spur edge) -- no manual nudge needed.
             route = [
                 [simulator.graph.nodes[node_id]["y"], simulator.graph.nodes[node_id]["x"]]
                 for node_id in path
@@ -466,10 +478,19 @@ class SimulationManager:
 
     def _choose_action(self) -> int:
         vehicle_id = self._info["next_vehicle_id"]
-        if self.algorithm == "dqn":
-            action, _ = self._dqn_model.predict(self._obs, deterministic=True)
-            return int(action)
-        return _BASELINE_POLICIES[self.algorithm](self.env.simulator, vehicle_id)
+        if self.algorithm == "dqn" and not RL_TEMPORARILY_DISABLED:
+            try:
+                action, _ = self._dqn_model.predict(self._obs, deterministic=True)
+                return int(action)
+            except Exception:
+                # Task 4: never let a DQN failure crash the background loop
+                # -- fall back to a baseline for this decision.
+                return _BASELINE_POLICIES[FALLBACK_ALGORITHM_WHILE_RL_DISABLED](
+                    self.env.simulator, vehicle_id
+                )
+        return _BASELINE_POLICIES[
+            self.algorithm if self.algorithm in _BASELINE_POLICIES else FALLBACK_ALGORITHM_WHILE_RL_DISABLED
+        ](self.env.simulator, vehicle_id)
 
     def _run_loop(self) -> None:
         while not self._shutdown_requested:

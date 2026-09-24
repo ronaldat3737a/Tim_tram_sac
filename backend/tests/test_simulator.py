@@ -318,3 +318,54 @@ def test_all_vehicles_done_reflects_completion_state():
         vehicle.state = VehicleState.COMPLETED
 
     assert simulator.all_vehicles_done() is True
+
+
+# --- Defensive NetworkXNoPath handling (Task 3 of the access-node refactor).
+# The graph is always built as one connected component in practice, so these
+# scenarios manually break connectivity after the fact purely to prove the
+# defensive try/except paths behave correctly and never crash the
+# simulation thread -- not because the real build_network() output can
+# actually produce them. -----------------------------------------------
+
+
+def _disconnect_node_from_graph(simulator: Simulator, node_id: int) -> None:
+    for neighbor in list(simulator.graph.neighbors(node_id)):
+        simulator.graph.remove_edge(node_id, neighbor)
+
+
+def test_energy_required_returns_infinity_when_station_unreachable_by_any_path():
+    simulator = Simulator(SMALL_CONFIG, seed=1)
+    vehicle = next(iter(simulator.vehicles.values()))
+    station = next(iter(simulator.stations.values()))
+    if vehicle.current_node == station.node_id:
+        vehicle.current_node = next(n for n in simulator.graph.nodes() if n != station.node_id)
+    _disconnect_node_from_graph(simulator, station.node_id)
+
+    assert simulator.energy_required(vehicle.vehicle_id, station.station_id) == float("inf")
+    assert simulator.is_station_reachable(vehicle.vehicle_id, station.station_id) is False
+
+
+def test_assign_station_raises_value_error_when_no_path_exists():
+    simulator = Simulator(SMALL_CONFIG, seed=1)
+    vehicle = next(iter(simulator.vehicles.values()))
+    station = next(iter(simulator.stations.values()))
+    vehicle.battery_level = 1.0  # ensure battery isn't the blocker
+    if vehicle.current_node == station.node_id:
+        vehicle.current_node = next(n for n in simulator.graph.nodes() if n != station.node_id)
+    _disconnect_node_from_graph(simulator, station.node_id)
+
+    with pytest.raises(ValueError):
+        simulator.assign_station(vehicle.vehicle_id, station.station_id)
+
+
+def test_route_to_depot_completes_vehicle_in_place_when_no_depot_reachable():
+    simulator = Simulator(SMALL_CONFIG, seed=1)
+    vehicle = next(iter(simulator.vehicles.values()))
+    for depot_node in simulator.depot_nodes:
+        _disconnect_node_from_graph(simulator, depot_node)
+
+    vehicle.state = VehicleState.CHARGING
+    simulator._route_to_depot(vehicle)
+
+    assert vehicle.state == VehicleState.COMPLETED
+    assert vehicle.target_depot is None

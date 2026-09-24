@@ -35,7 +35,12 @@ class EdgeInfo(BaseModel):
 
 class StationInfo(BaseModel):
     id: int
+    # The station's own POI node id -- both the routing target and its
+    # (x, y) display position (see NodeInfo for that node's coordinates).
+    # Not a real traffic node itself: connects to one via a short spur edge.
     node_id: int
+    # The real traffic node that spur edge connects to.
+    access_node_id: int
     capacity: int
     num_chargers: int
 
@@ -43,6 +48,7 @@ class StationInfo(BaseModel):
 class DepotInfo(BaseModel):
     id: int
     node_id: int
+    access_node_id: int
 
 
 class NetworkInfo(BaseModel):

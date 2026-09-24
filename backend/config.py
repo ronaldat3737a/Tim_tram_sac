@@ -109,7 +109,20 @@ class SimulationConfig:
     osm_center_lat: float = 21.0385
     osm_center_lng: float = 105.7973
     osm_radius_meters: float = 1000.0
-    osm_cache_path: str = "data/osm_network.graphml"
+    osm_cache_path: str = "data/osm_nghia_do.graphml"
+
+    # --- Station/depot POI (spatial-geometry refactor). A station/depot is
+    # not itself a traffic node: it is a small POI node connected to one
+    # real "access node" by a short spur edge, offset a real physical
+    # distance perpendicular to the access node's road (Task 2 -- an actual
+    # orthogonal-offset computation, not an arbitrary degree delta) so it
+    # renders beside the road, never on top of it.
+    poi_offset_meters: float = 10.0
+    # Speed an EV crawls the spur at while entering/exiting a station or
+    # depot (Task 3: a real, if brief, "smooth transition trajectory" --
+    # not a teleport) -- a deliberately slow, fixed "parking maneuver" pace,
+    # independent of the EV's own top speed on the real road network.
+    poi_approach_speed_mps: float = 1.5
 
 
 DEFAULT_CONFIG = SimulationConfig()

@@ -8,11 +8,17 @@ import { useState } from "react";
 import { Pause, Play, RotateCcw } from "lucide-react";
 import type { Algorithm, SimulationStatusResponse } from "@/lib/types";
 
+// DQN is temporarily left out of the picker (Task 4 of the access-node/
+// real-map refactor: RL is frozen out while the new map/POI physics are
+// validated against baselines only -- backend/api/simulation_manager.py's
+// RL_TEMPORARILY_DISABLED silently downgrades a "dqn" request anyway, but
+// not offering it here avoids implying it's meaningfully selectable).
+// Re-add { value: "dqn", label: "DQN (trained model)" } once RL is
+// retrained against the new graph and re-validated.
 const ALGORITHMS: { value: Algorithm; label: string }[] = [
   { value: "nearest_station", label: "Nearest Station" },
   { value: "shortest_time", label: "Shortest Travel Time" },
   { value: "least_queue", label: "Least Queue" },
-  { value: "dqn", label: "DQN (trained model)" },
 ];
 
 interface ControlPanelProps {

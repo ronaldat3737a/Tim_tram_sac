@@ -35,12 +35,19 @@ class Simulator:
         self.simulation_time += self.config.time_step
 
     def energy_required(self, vehicle_id: int, station_id: int) -> float:
-        """Battery needed to reach a station via the shortest path (section 20)."""
+        """Battery needed to reach a station via the shortest path (section 20).
+        Returns infinity if no path exists at all (defensive: the graph is
+        built as a single connected component, so this should never trigger
+        in practice, but a station must never be reported reachable, nor
+        crash the simulation thread, if it somehow did)."""
         vehicle = self.vehicles[vehicle_id]
         station = self.stations[station_id]
-        _, distance, _ = shortest_path(
-            self.graph, vehicle.current_node, station.node_id, weight=self.config.routing_weight
-        )
+        try:
+            _, distance, _ = shortest_path(
+                self.graph, vehicle.current_node, station.node_id, weight=self.config.routing_weight
+            )
+        except nx.NetworkXNoPath:
+            return float("inf")
         return self.config.battery_consumption_per_distance * distance
 
     def is_station_reachable(self, vehicle_id: int, station_id: int) -> bool:
@@ -59,9 +66,14 @@ class Simulator:
             )
         vehicle = self.vehicles[vehicle_id]
         station = self.stations[station_id]
-        path, _, _ = shortest_path(
-            self.graph, vehicle.current_node, station.node_id, weight=self.config.routing_weight
-        )
+        try:
+            path, _, _ = shortest_path(
+                self.graph, vehicle.current_node, station.node_id, weight=self.config.routing_weight
+            )
+        except nx.NetworkXNoPath as exc:
+            raise ValueError(
+                f"station {station_id} is not reachable for vehicle {vehicle_id}: no path exists"
+            ) from exc
         vehicle.target_station = station_id
         vehicle.route = path
         vehicle.edge_progress = 0.0
@@ -93,7 +105,15 @@ class Simulator:
 
     def _build_vehicles(self) -> dict[int, Vehicle]:
         vehicles = {}
-        node_ids = list(self.graph.nodes())
+        # Station/depot POI nodes are not real traffic nodes (they only
+        # exist to be routed *to*, via their spur edge) -- excluded here so
+        # no EV ever spawns at, or is assigned a personal destination at,
+        # a parking spot instead of a real intersection.
+        node_ids = [
+            n
+            for n, data in self.graph.nodes(data=True)
+            if not data["is_station"] and not data["is_depot"]
+        ]
         for vehicle_id in range(self.config.num_vehicles):
             current_node = int(self.rng.choice(node_ids))
             destination_candidates = [n for n in node_ids if n != current_node]
@@ -102,9 +122,18 @@ class Simulator:
                 self.rng.uniform(self.config.low_battery_threshold, self.config.battery_capacity)
             )
             speed = float(self.rng.uniform(self.config.min_speed, self.config.max_speed))
-            path, _, _ = shortest_path(
-                self.graph, current_node, destination_node, weight=self.config.routing_weight
-            )
+            # Defensive: the graph is built as a single connected component,
+            # so every node pair has a path in practice. If that ever fails
+            # to hold, spawn this EV already at its destination (an
+            # immediate, harmless COMPLETED) instead of crashing the
+            # simulation thread.
+            try:
+                path, _, _ = shortest_path(
+                    self.graph, current_node, destination_node, weight=self.config.routing_weight
+                )
+            except nx.NetworkXNoPath:
+                destination_node = current_node
+                path = [current_node]
             vehicles[vehicle_id] = Vehicle(
                 vehicle_id=vehicle_id,
                 current_node=current_node,
@@ -187,22 +216,34 @@ class Simulator:
         route's real road geometry exactly like any other trip (explicit
         user-requested extension: depot return is real simulated movement,
         not a frontend-only cosmetic)."""
-        depot_index, path = self._nearest_depot(vehicle.current_node)
         vehicle.target_station = None
+        depot_index, path = self._nearest_depot(vehicle.current_node)
+        if depot_index is None:
+            # Defensive: no depot has a path from here at all (should never
+            # happen -- the graph is one connected component -- but must
+            # not crash the simulation thread if it somehow did). The EV
+            # just completes its trip where it is instead of being stuck.
+            vehicle.state = VehicleState.COMPLETED
+            vehicle.target_depot = None
+            return
         vehicle.target_depot = depot_index
         vehicle.state = VehicleState.RETURNING_TO_DEPOT
         vehicle.route = path
         vehicle.edge_progress = 0.0
 
-    def _nearest_depot(self, node_id: int) -> tuple[int, list[int]]:
+    def _nearest_depot(self, node_id: int) -> tuple[int | None, list[int] | None]:
         """Returns (index into self.depot_nodes, path) for the closest
         depot -- an index, like target_station, rather than a raw node id,
-        so the API/frontend can address depots the same way stations are."""
+        so the API/frontend can address depots the same way stations are.
+        Returns (None, None) if no depot has a path from node_id at all."""
         best_index, best_path, best_cost = None, None, float("inf")
         for depot_index, depot_node in enumerate(self.depot_nodes):
-            path, distance, travel_time = shortest_path(
-                self.graph, node_id, depot_node, weight=self.config.routing_weight
-            )
+            try:
+                path, distance, travel_time = shortest_path(
+                    self.graph, node_id, depot_node, weight=self.config.routing_weight
+                )
+            except nx.NetworkXNoPath:
+                continue
             cost = distance if self.config.routing_weight == "distance" else travel_time
             if cost < best_cost:
                 best_index, best_path, best_cost = depot_index, path, cost

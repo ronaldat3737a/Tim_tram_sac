@@ -7,8 +7,9 @@ import pytest
 from stable_baselines3 import DQN
 
 from backend.api import simulation_manager as simulation_manager_module
-from backend.api.simulation_manager import SimulationManager
+from backend.api.simulation_manager import SimulationManager, _interpolate_position
 from backend.config import DEFAULT_CONFIG
+from backend.simulation.vehicle import VehicleState
 
 SMALL_CONFIG = replace(DEFAULT_CONFIG, num_vehicles=5, max_episode_steps=800)
 TRAINED_MODEL_PATH = Path("models/dqn_ev_dispatch.zip")
@@ -68,6 +69,12 @@ def test_dqn_model_loading_does_not_block_status_requests(monkeypatch):
         return real_model
 
     monkeypatch.setattr(simulation_manager_module.DQN, "load", staticmethod(slow_load))
+    # RL is temporarily frozen out by default (Task 4 of the access-node/
+    # real-map refactor) -- a "dqn" request is silently downgraded before
+    # ever reaching _ensure_dqn_model_loaded(). This test is specifically
+    # about that loading-doesn't-block-other-requests mechanism, so it
+    # bypasses the freeze just for itself.
+    monkeypatch.setattr(simulation_manager_module, "RL_TEMPORARILY_DISABLED", False)
 
     config = replace(DEFAULT_CONFIG, num_vehicles=5, max_episode_steps=800)
     manager = SimulationManager(config)
@@ -109,4 +116,49 @@ def test_network_info_edge_geometry_matches_graph_distance_semantics(manager):
     for u, v, data in graph.edges(data=True):
         assert "distance" in data and data["distance"] > 0
         assert "travel_time" in data and data["travel_time"] > 0
-        assert len(data["geometry"]) >= 2
+        assert len(data["geometry"].coords) >= 2
+
+
+def test_network_info_stations_and_depots_report_access_node(manager):
+    # Spatial-geometry refactor: a station/depot's own (x, y) -- its POI
+    # node, in `nodes` -- is beside the road; access_node_id is the real
+    # traffic node its spur edge connects to.
+    info = manager.get_network_info()
+    assert len(info["stations"]) > 0
+    assert len(info["depots"]) > 0
+    node_ids = {node["id"] for node in info["nodes"]}
+    for station in info["stations"]:
+        assert station["access_node_id"] in node_ids
+        assert station["access_node_id"] != station["node_id"]
+    for depot in info["depots"]:
+        assert depot["access_node_id"] in node_ids
+        assert depot["access_node_id"] != depot["node_id"]
+
+
+def test_interpolate_position_reaches_the_station_poi_node_while_waiting_or_charging(manager):
+    # The station's POI is a real graph node reached via a real spur edge
+    # (network_graph._add_poi_nodes) -- once arrived, display position is
+    # simply that node's own (x, y), the same as for any other node.
+    simulator = manager.env.simulator
+    vehicle = next(iter(simulator.vehicles.values()))
+    station = next(iter(simulator.stations.values()))
+    vehicle.current_node = station.node_id
+    vehicle.target_station = station.station_id
+    vehicle.route = [station.node_id]
+
+    expected = (simulator.graph.nodes[station.node_id]["x"], simulator.graph.nodes[station.node_id]["y"])
+    for state in (VehicleState.WAITING, VehicleState.CHARGING):
+        vehicle.state = state
+        assert _interpolate_position(simulator, vehicle) == expected
+
+
+def test_interpolate_position_reaches_the_depot_poi_node_once_completed(manager):
+    simulator = manager.env.simulator
+    vehicle = next(iter(simulator.vehicles.values()))
+    depot_node = simulator.depot_nodes[0]
+    vehicle.current_node = depot_node
+    vehicle.route = [depot_node]
+    vehicle.state = VehicleState.COMPLETED
+
+    expected = (simulator.graph.nodes[depot_node]["x"], simulator.graph.nodes[depot_node]["y"])
+    assert _interpolate_position(simulator, vehicle) == expected

@@ -15,15 +15,22 @@ from dataclasses import replace
 import networkx as nx
 import pytest
 
+from shapely.geometry import LineString, Point
+
 from backend.config import DEFAULT_CONFIG
 from backend.simulation import network_graph
 from backend.simulation.network_graph import (
     build_network,
+    get_depot_access_nodes,
     get_depot_nodes,
+    get_station_access_nodes,
     get_station_nodes,
     shortest_path,
 )
 from backend.tests.conftest import fake_osm_multidigraph
+
+_REAL_NODE_COUNT = 121  # conftest's fake extract, after dropping 2 isolated nodes
+_TOTAL_POI_COUNT = DEFAULT_CONFIG.num_stations + DEFAULT_CONFIG.num_depots
 
 # Captured at module-import time, before conftest's autouse fixture ever
 # monkeypatches network_graph._load_or_fetch_osm_graph for a given test --
@@ -36,9 +43,13 @@ def test_build_network_is_connected_with_correct_station_and_depot_count():
     graph = build_network(DEFAULT_CONFIG)
 
     assert nx.is_connected(graph)
-    assert graph.number_of_nodes() == 121  # the 2 isolated fake nodes are dropped
+    # Real road nodes, plus one POI node per station/depot (each connected
+    # by its own spur edge -- see network_graph._add_poi_nodes).
+    assert graph.number_of_nodes() == _REAL_NODE_COUNT + _TOTAL_POI_COUNT
     assert len(get_station_nodes(graph)) == DEFAULT_CONFIG.num_stations
     assert len(get_depot_nodes(graph)) == DEFAULT_CONFIG.num_depots
+    assert len(get_station_access_nodes(graph)) == DEFAULT_CONFIG.num_stations
+    assert len(get_depot_access_nodes(graph)) == DEFAULT_CONFIG.num_depots
 
 
 def test_build_network_node_coordinates_are_real_lng_lat():
@@ -53,17 +64,27 @@ def test_build_network_edge_attributes_present_and_consistent():
     graph = build_network(DEFAULT_CONFIG)
 
     for u, v, data in graph.edges(data=True):
+        # A POI's spur edge is not a real road edge -- it deliberately runs
+        # at the fixed, slow poi_approach_speed_mps, not the randomized
+        # real-road speed range.
+        is_spur_edge = graph.nodes[u]["is_station"] or graph.nodes[u]["is_depot"] or graph.nodes[v]["is_station"] or graph.nodes[v]["is_depot"]
+
         assert data["distance"] > 0
-        assert DEFAULT_CONFIG.min_speed <= data["speed"] <= DEFAULT_CONFIG.max_speed
-        assert (
-            DEFAULT_CONFIG.min_traffic_weight
-            <= data["traffic_weight"]
-            <= DEFAULT_CONFIG.max_traffic_weight
-        )
+        if is_spur_edge:
+            assert data["speed"] == pytest.approx(DEFAULT_CONFIG.poi_approach_speed_mps)
+            assert data["traffic_weight"] == 0.0
+        else:
+            assert DEFAULT_CONFIG.min_speed <= data["speed"] <= DEFAULT_CONFIG.max_speed
+            assert (
+                DEFAULT_CONFIG.min_traffic_weight
+                <= data["traffic_weight"]
+                <= DEFAULT_CONFIG.max_traffic_weight
+            )
         effective_speed = data["speed"] / (1.0 + data["traffic_weight"])
         expected_travel_time = data["distance"] / effective_speed
         assert data["travel_time"] == pytest.approx(expected_travel_time)
-        assert len(data["geometry"]) >= 2
+        # Task 1: every edge's geometry is a real shapely LineString.
+        assert len(data["geometry"].coords) >= 2
         assert data["geometry_start"] in (u, v)
 
 
@@ -81,6 +102,66 @@ def test_build_network_station_and_depot_nodes_flagged_on_graph():
         assert graph.nodes[node_id]["is_station"] is False
 
 
+def test_build_network_station_poi_is_connected_to_its_access_node_by_a_spur():
+    # Task 2/3: a station is a POI node reached by exactly one short spur
+    # edge from its real access node -- routing/movement need no special
+    # casing, they just traverse this like any other edge.
+    graph = build_network(DEFAULT_CONFIG)
+    station_nodes = get_station_nodes(graph)
+    access_nodes = get_station_access_nodes(graph)
+
+    for poi_node, access_node in zip(station_nodes, access_nodes):
+        assert graph.has_edge(access_node, poi_node)
+        edge = graph.edges[access_node, poi_node]
+        assert edge["distance"] == pytest.approx(DEFAULT_CONFIG.poi_offset_meters)
+        assert graph.degree(poi_node) == 1  # a dead-end parking spur, nothing else attaches to it
+
+
+def test_build_network_depot_poi_is_connected_to_its_access_node_by_a_spur():
+    graph = build_network(DEFAULT_CONFIG)
+    depot_nodes = get_depot_nodes(graph)
+    access_nodes = get_depot_access_nodes(graph)
+
+    for poi_node, access_node in zip(depot_nodes, access_nodes):
+        assert graph.has_edge(access_node, poi_node)
+        edge = graph.edges[access_node, poi_node]
+        assert edge["distance"] == pytest.approx(DEFAULT_CONFIG.poi_offset_meters)
+        assert graph.degree(poi_node) == 1
+
+
+# --- Task 2's required proof: the orthogonal-offset algorithm must return a
+# point that does NOT lie on the original road edge it was offset from.
+# Unit-tested directly against a controlled LineString (rather than checking
+# every edge incident to a real access node in the built graph): the fake
+# test fixture's streets are perfectly axis-aligned, so a real access node
+# can coincidentally have a SECOND, unrelated road edge exactly collinear
+# with the offset direction -- a fixture quirk, not a property of the
+# offset algorithm itself, which this isolates against. ---------------------
+
+
+def test_perpendicular_offset_point_is_not_on_a_north_south_edge():
+    line = LineString([(105.80, 21.00), (105.80, 21.01)])  # constant longitude
+    offset_point = Point(network_graph._perpendicular_offset_point(line, (105.80, 21.00), 10.0))
+
+    assert line.distance(offset_point) > 0
+
+
+def test_perpendicular_offset_point_is_not_on_an_east_west_edge():
+    line = LineString([(105.80, 21.00), (105.81, 21.00)])  # constant latitude
+    offset_point = Point(network_graph._perpendicular_offset_point(line, (105.80, 21.00), 10.0))
+
+    assert line.distance(offset_point) > 0
+
+
+def test_station_poi_offsets_are_distinct_per_station():
+    # Different stations must not collapse onto the same displayed point.
+    graph = build_network(DEFAULT_CONFIG)
+    station_nodes = get_station_nodes(graph)
+    positions = [(graph.nodes[n]["x"], graph.nodes[n]["y"]) for n in station_nodes]
+
+    assert len(set(positions)) == len(positions)
+
+
 def test_build_network_reproducible_with_same_seed():
     graph_a = build_network(DEFAULT_CONFIG, seed=123)
     graph_b = build_network(DEFAULT_CONFIG, seed=123)
@@ -89,6 +170,8 @@ def test_build_network_reproducible_with_same_seed():
     assert sorted(graph_a.edges()) == sorted(graph_b.edges())
     assert get_station_nodes(graph_a) == get_station_nodes(graph_b)
     assert get_depot_nodes(graph_a) == get_depot_nodes(graph_b)
+    assert get_station_access_nodes(graph_a) == get_station_access_nodes(graph_b)
+    assert get_depot_access_nodes(graph_a) == get_depot_access_nodes(graph_b)
     for node_id in graph_a.nodes():
         assert graph_a.nodes[node_id]["x"] == graph_b.nodes[node_id]["x"]
         assert graph_a.nodes[node_id]["y"] == graph_b.nodes[node_id]["y"]
@@ -150,7 +233,7 @@ def test_build_network_drops_nodes_outside_the_largest_component():
     graph = build_network(DEFAULT_CONFIG)
 
     # conftest's fake extract has 2 nodes with no path to the main grid.
-    assert graph.number_of_nodes() == 121
+    assert graph.number_of_nodes() == _REAL_NODE_COUNT + _TOTAL_POI_COUNT
 
 
 def _manual_diamond_graph() -> nx.Graph:

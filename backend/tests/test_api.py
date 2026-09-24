@@ -123,7 +123,12 @@ def test_start_with_invalid_algorithm_returns_422():
     assert response.status_code == 422
 
 
-def test_start_with_dqn_missing_model_returns_400(monkeypatch, tmp_path):
+def test_start_with_dqn_request_is_silently_downgraded_to_baseline_while_rl_disabled(monkeypatch, tmp_path):
+    # Task 4 of the access-node/real-map refactor: RL is temporarily frozen
+    # out (RL_TEMPORARILY_DISABLED) while the new map/POI physics are
+    # validated against baselines only. Requesting "dqn" must never 400 or
+    # try to load a model at all -- it silently runs as the fallback
+    # baseline instead, so a missing model file is irrelevant here.
     monkeypatch.setattr(simulation_manager_module, "DQN_MODEL_PATH", tmp_path / "missing.zip")
 
     with TestClient(create_app(TEST_CONFIG)) as client:
@@ -131,7 +136,8 @@ def test_start_with_dqn_missing_model_returns_400(monkeypatch, tmp_path):
             "/api/simulation/start", json={"algorithm": "dqn", "speed": FAST_SPEED}
         )
 
-    assert response.status_code == 400
+    assert response.status_code == 200
+    assert response.json()["algorithm"] == simulation_manager_module.FALLBACK_ALGORITHM_WHILE_RL_DISABLED
 
 
 def test_speed_endpoint_updates_reported_speed():
