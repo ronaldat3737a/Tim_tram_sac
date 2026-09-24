@@ -1,0 +1,40 @@
+@import "tailwindcss";
+
+:root {
+  --background: #ffffff;
+  --foreground: #171717;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0a0a;
+    --foreground: #ededed;
+  }
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+/* Vehicle markers intentionally have NO transform transition: each
+   WebSocket update already reports a position computed by the backend as
+   an interpolation along the CURRENT road edge's real geometry
+   (simulator.py + simulation_manager.py), which is also exactly what the
+   road itself is drawn from -- the two never diverge, so there is no
+   "cuts across a curve" case a position transition would need to paper
+   over. Snapping instantly to each backend-reported position keeps the
+   marker exactly where the simulation says it is, at all times. Opacity is
+   still allowed to transition, for the post-arrival depot fade-out, since
+   animating transparency never moves the marker off its real position. */
+.leaflet-marker-icon.ev-marker-icon {
+  transition: opacity 2000ms ease-out;
+}
