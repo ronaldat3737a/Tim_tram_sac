@@ -101,6 +101,7 @@ class _EpisodeAccumulator:
     num_invalid_actions: int = 0
     num_overloaded_events: int = 0
     num_stranded_vehicles: int = 0
+    num_resolved_dispatches: int = 0
     total_travel_time: float = 0.0
     total_waiting_time: float = 0.0
     episode_reward: float = 0.0
@@ -112,28 +113,25 @@ class _EpisodeAccumulator:
             self.num_invalid_actions += 1
         else:
             self.num_valid_decisions += 1
-        # An invalid pick still dispatches the EV (to EVEnv's fallback
-        # station), so its trip counts toward travel/waiting/overload too.
         if info["stranded"]:
             self.num_stranded_vehicles += 1
-        else:
-            self.total_travel_time += info["travel_time"]
-            self.total_waiting_time += info["waiting_time"]
-            if info["station_overloaded"]:
-                self.num_overloaded_events += 1
-
-    @property
-    def _num_dispatched_decisions(self) -> int:
-        return self.num_decisions - self.num_stranded_vehicles
+        if info["station_overloaded"]:
+            self.num_overloaded_events += 1
+        # Trips (including invalid picks sent to EVEnv's fallback station)
+        # that resolved -- started charging or failed -- during this step.
+        for trip in info["resolved"]:
+            self.num_resolved_dispatches += 1
+            self.total_travel_time += trip["travel_time"]
+            self.total_waiting_time += trip["waiting_time"]
 
     @property
     def average_travel_time(self) -> float:
-        n = self._num_dispatched_decisions
+        n = self.num_resolved_dispatches
         return self.total_travel_time / n if n else 0.0
 
     @property
     def average_waiting_time(self) -> float:
-        n = self._num_dispatched_decisions
+        n = self.num_resolved_dispatches
         return self.total_waiting_time / n if n else 0.0
 
     @property

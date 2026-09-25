@@ -150,8 +150,17 @@ class Simulator:
             if vehicle.state not in (VehicleState.TRAVELING, VehicleState.RETURNING_TO_DEPOT):
                 continue
             if needs_charging_decision(vehicle, self.config):
+                # Held in place until it is dispatched. EVEnv never ticks
+                # while a decision is pending, so in practice this lasts zero
+                # ticks; if anything ever does tick past it, standing on the
+                # road still costs battery (A/C, electronics) and can end in
+                # FAILED, never in a free wait.
+                self._drain_idle_battery(vehicle)
                 continue
             if not vehicle.route:
+                # Defensive: a vehicle on the road with no route at all could
+                # never move again. Fail it instead of leaving it parked.
+                vehicle.state = VehicleState.FAILED
                 continue
             if len(vehicle.route) == 1:
                 # Already standing at the route's target node (e.g. a
@@ -164,6 +173,11 @@ class Simulator:
                 vehicle.time_since_station_assigned += self.config.time_step
 
             self._advance_vehicle_along_route(vehicle)
+
+    def _drain_idle_battery(self, vehicle: Vehicle) -> None:
+        vehicle.set_battery_level(vehicle.battery_level - self.config.idle_battery_drain_per_tick * self.config.time_step)
+        if vehicle.battery_level <= 0.0:
+            vehicle.state = VehicleState.FAILED
 
     def _advance_vehicle_along_route(self, vehicle: Vehicle) -> None:
         movement_budget = self._movement_budget(vehicle)

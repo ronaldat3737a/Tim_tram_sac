@@ -97,6 +97,7 @@ def test_episode_metrics_derived_properties():
         truncated=False,
         simulation_time=100.0,
         num_stranded_vehicles=1,
+        num_resolved_dispatches=4,
     )
 
     assert metrics.average_travel_time == pytest.approx(10.0)

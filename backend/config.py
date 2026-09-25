@@ -73,6 +73,11 @@ class SimulationConfig:
     # real street graph's station placement, and are not claimed to still
     # hold exactly.
     low_battery_threshold: float = 0.5
+    # Battery drained per simulated second by an EV standing still on the
+    # road (A/C, electronics) -- roughly a tenth of what driving at a
+    # typical urban speed costs. Never applies inside a station (queued or
+    # charging).
+    idle_battery_drain_per_tick: float = 0.0001
 
     # --- Charging station (PROJECT_SPEC.md section 12) ---
     # capacity is the total number of slots at a station, i.e.

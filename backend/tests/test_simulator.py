@@ -120,10 +120,15 @@ def test_needs_decision_vehicle_is_blocked_until_station_assigned():
 
     assert vehicle in simulator.get_vehicles_needing_decision()
 
+    battery_before = vehicle.battery_level
     simulator.tick()
 
     assert vehicle.route == route_before
     assert vehicle.current_node == node_before
+    # Standing still on the road still drains the battery.
+    assert vehicle.battery_level == pytest.approx(
+        battery_before - SMALL_CONFIG.idle_battery_drain_per_tick * SMALL_CONFIG.time_step
+    )
 
     station_id = next(iter(simulator.stations))
     simulator.assign_station(vehicle.vehicle_id, station_id)
@@ -369,3 +374,24 @@ def test_route_to_depot_completes_vehicle_in_place_when_no_depot_reachable():
 
     assert vehicle.state == VehicleState.COMPLETED
     assert vehicle.target_depot is None
+
+
+def test_vehicle_held_on_road_fails_once_idle_drain_empties_battery():
+    simulator = Simulator(SMALL_CONFIG, seed=7)
+    vehicle = next(iter(simulator.vehicles.values()))
+    vehicle.battery_level = SMALL_CONFIG.idle_battery_drain_per_tick / 2
+
+    simulator.tick()
+
+    assert vehicle.state == VehicleState.FAILED
+
+
+def test_vehicle_on_road_with_empty_route_fails_instead_of_parking():
+    simulator = Simulator(SMALL_CONFIG, seed=7)
+    vehicle = next(iter(simulator.vehicles.values()))
+    vehicle.battery_level = 1.0
+    vehicle.route = []
+
+    simulator.tick()
+
+    assert vehicle.state == VehicleState.FAILED

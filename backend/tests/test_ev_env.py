@@ -98,17 +98,11 @@ def test_invalid_action_is_penalized_and_falls_back_to_nearest_reachable_station
     assert info["stranded"] is False
     assert info["requested_station_id"] == unreachable_id
     assert info["station_id"] == reachable_id
-    # The decision is resolved: the EV was dispatched, not left pending.
+    # The EV was dispatched to the fallback at once, not left pending.
     vehicle = env.simulator.vehicles[vehicle_id]
-    assert vehicle.state != VehicleState.TRAVELING or vehicle.target_station is not None
-    assert info["next_vehicle_id"] != vehicle_id or info["next_vehicle_id"] is None
-    outcome = -(
-        SMALL_CONFIG.reward_travel_weight * info["travel_time"]
-        + SMALL_CONFIG.reward_waiting_weight * info["waiting_time"]
-    ) + (SMALL_CONFIG.station_overload_penalty if info["station_overloaded"] else 0.0)
-    if info["vehicle_failed"]:
-        outcome = SMALL_CONFIG.battery_failure_penalty
-    assert reward == pytest.approx((outcome + SMALL_CONFIG.invalid_action_penalty) * SMALL_CONFIG.reward_scale)
+    assert vehicle.target_station == reachable_id
+    assert vehicle not in env.simulator.get_vehicles_needing_decision()
+    assert reward <= SMALL_CONFIG.invalid_action_penalty * SMALL_CONFIG.reward_scale
 
 
 def test_invalid_action_always_scores_worse_than_choosing_the_fallback_directly():
@@ -134,7 +128,6 @@ def test_vehicle_with_no_reachable_station_is_stranded_not_counted_invalid():
 
     assert info2["invalid_action"] is False
     assert info2["stranded"] is True
-    assert info2["vehicle_failed"] is True
     assert vehicle.state == VehicleState.FAILED
     assert reward == pytest.approx(SMALL_CONFIG.battery_failure_penalty * SMALL_CONFIG.reward_scale)
 
@@ -179,12 +172,15 @@ def test_reward_matches_travel_and_waiting_time_formula():
 
     observation, reward, terminated, truncated, info2 = env.step(station_id)
 
+    # The only EV, so this one step runs until its trip resolves.
     assert info2["invalid_action"] is False
-    assert info2["travel_time"] == pytest.approx(0.0)
-    assert info2["waiting_time"] == pytest.approx(config.time_step)
+    [trip] = info2["resolved"]
+    assert trip["vehicle_id"] == vehicle_id and trip["failed"] is False
+    assert trip["travel_time"] == pytest.approx(0.0)
+    assert trip["waiting_time"] == pytest.approx(config.time_step)
     expected_reward = -(
-        config.reward_travel_weight * info2["travel_time"]
-        + config.reward_waiting_weight * info2["waiting_time"]
+        config.reward_travel_weight * trip["travel_time"]
+        + config.reward_waiting_weight * trip["waiting_time"]
     )
     if info2["station_overloaded"]:
         expected_reward += config.station_overload_penalty
@@ -341,3 +337,69 @@ def test_action_index_maps_to_real_station_node():
         station_id = env.station_id_for_action(action)
         assert env.simulator.stations[station_id].node_id in station_nodes
     assert len({env.station_id_for_action(a) for a in range(env.action_space.n)}) == env.action_space.n
+
+
+def test_no_ev_is_ever_held_on_the_road_awaiting_a_decision():
+    # Regression: step() used to fast-forward until the dispatched EV
+    # started charging, while every other EV that hit the threshold in the
+    # meantime stood still on the road (thousands of ticks on the OSM map).
+    # An EV can cross the threshold during a tick; it is only "held" if it
+    # is still undecided after a further tick.
+    held_ticks = 0
+    pending_after_last_tick: set[int] = set()
+
+    def count_held(simulator):
+        nonlocal held_ticks, pending_after_last_tick
+        pending = {v.vehicle_id for v in simulator.get_vehicles_needing_decision()}
+        held_ticks += len(pending & pending_after_last_tick)
+        pending_after_last_tick = pending
+
+    env = EVEnv(SMALL_CONFIG, tick_hook=count_held)
+    env.reset(seed=8)
+    done = False
+    while not done:
+        _, _, terminated, truncated, _ = env.step(env.action_space.sample())
+        done = terminated or truncated
+
+    assert held_ticks == 0
+
+
+def test_step_returns_without_ticking_when_another_ev_is_already_pending():
+    env = EVEnv(SMALL_CONFIG)
+    _, info = env.reset(seed=8)
+    other = next(
+        v for v in env.simulator.vehicles.values()
+        if v.vehicle_id != info["next_vehicle_id"] and v.state == VehicleState.TRAVELING
+    )
+    other.battery_level = SMALL_CONFIG.low_battery_threshold
+    time_before = env.simulator.simulation_time
+
+    _, _, _, _, info2 = env.step(0)
+
+    assert env.simulator.simulation_time == time_before
+    assert info2["next_vehicle_id"] == other.vehicle_id
+
+
+def test_episode_reward_totals_all_travel_and_waiting_time():
+    config = replace(SMALL_CONFIG, station_overload_penalty=0.0)
+    env = EVEnv(config)
+    env.reset(seed=8)
+    total_reward = 0.0
+    trips = []
+    penalties = 0.0
+    done = False
+    while not done:
+        _, reward, terminated, truncated, info = env.step(env.action_space.sample())
+        total_reward += reward
+        trips += info["resolved"]
+        penalties += config.invalid_action_penalty * info["invalid_action"]
+        penalties += config.battery_failure_penalty * info["stranded"]
+        done = terminated or truncated
+
+    assert terminated and not env._in_flight  # every dispatched trip resolved
+    expected = penalties + sum(
+        -(config.reward_travel_weight * t["travel_time"] + config.reward_waiting_weight * t["waiting_time"])
+        + (config.battery_failure_penalty if t["failed"] else 0.0)
+        for t in trips
+    )
+    assert total_reward == pytest.approx(expected * config.reward_scale)
