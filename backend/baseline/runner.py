@@ -76,14 +76,25 @@ class EpisodeMetrics:
     average_queue_length: float = 0.0
     maximum_queue_length: float = 0.0
     station_utilization: float = 0.0
+    # EVs that needed a decision with no station reachable at all (EVEnv
+    # strands them immediately; also counted in num_failed_vehicles).
+    num_stranded_vehicles: int = 0
+
+    @property
+    def num_dispatched_decisions(self) -> int:
+        """Decisions that actually sent an EV to a station -- valid picks
+        and invalid picks overridden by EVEnv's fallback alike."""
+        return self.num_decisions - self.num_stranded_vehicles
 
     @property
     def average_travel_time(self) -> float:
-        return self.total_travel_time / self.num_valid_decisions if self.num_valid_decisions else 0.0
+        n = self.num_dispatched_decisions
+        return self.total_travel_time / n if n else 0.0
 
     @property
     def average_waiting_time(self) -> float:
-        return self.total_waiting_time / self.num_valid_decisions if self.num_valid_decisions else 0.0
+        n = self.num_dispatched_decisions
+        return self.total_waiting_time / n if n else 0.0
 
     @property
     def total_system_cost(self) -> float:
@@ -102,6 +113,7 @@ def run_episode(
     num_invalid_actions = 0
     num_failed_vehicles = 0
     num_overloaded_events = 0
+    num_stranded_vehicles = 0
     total_travel_time = 0.0
     total_waiting_time = 0.0
     episode_reward = 0.0
@@ -117,12 +129,17 @@ def run_episode(
             num_invalid_actions += 1
         else:
             num_valid_decisions += 1
+        # An invalid pick still dispatches the EV (to EVEnv's fallback
+        # station), so its trip counts toward travel/waiting/overload too.
+        if info["stranded"]:
+            num_stranded_vehicles += 1
+        else:
             total_travel_time += info["travel_time"]
             total_waiting_time += info["waiting_time"]
             if info["station_overloaded"]:
                 num_overloaded_events += 1
-            if info["vehicle_failed"]:
-                num_failed_vehicles += 1
+        if info["vehicle_failed"]:
+            num_failed_vehicles += 1
 
     return EpisodeMetrics(
         policy_name=policy_name,
@@ -141,6 +158,7 @@ def run_episode(
         average_queue_length=collector.average_queue_length,
         maximum_queue_length=collector.maximum_queue_length,
         station_utilization=collector.station_utilization,
+        num_stranded_vehicles=num_stranded_vehicles,
     )
 
 

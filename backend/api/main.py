@@ -11,7 +11,6 @@ inference. It never trains a model (that runs separately via
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from dataclasses import replace
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.api.routes.simulation import router as simulation_router
 from backend.api.simulation_manager import SimulationManager
 from backend.api.websockets import router as websocket_router
-from backend.config import DEFAULT_CONFIG, SimulationConfig
+from backend.config import OSM_DEMO_CONFIG, SimulationConfig
 
 # The Next.js dev server (frontend/, section 7) runs on a different origin
 # (typically localhost:3000) than this API (localhost:8000), so the browser
@@ -31,17 +30,9 @@ DEV_FRONTEND_ORIGINS = [
     "http://127.0.0.1:3000",
 ]
 
-# Live-demo-only override: a full 0.0 -> 1.0 charge takes ~900 simulated
-# ticks, which is ~180 real seconds (~3 min) at the default UI speed of 5
-# ticks/sec, so the battery bar visibly ticks up during a demo instead of
-# taking the ~20 simulated ticks (config.charging_rate=0.05) calibrated for
-# training/evaluation. This is a SEPARATE config from DEFAULT_CONFIG on
-# purpose: DEFAULT_CONFIG stays exactly as-is so ai_core/train.py and
-# ai_core/evaluate.py keep using the value the already-trained model and
-# saved results/ were calibrated against (changing it there would silently
-# invalidate that calibration). Real-time duration still scales with
-# whatever speed the user picks in the UI.
-DEMO_CONFIG = replace(DEFAULT_CONFIG, charging_rate=1.0 / 900)
+# Defined in backend/config.py so ai_core/train.py trains on the exact same
+# scenario the live demo serves (see OSM_DEMO_CONFIG's own comment).
+DEMO_CONFIG = OSM_DEMO_CONFIG
 
 
 def create_app(config: SimulationConfig = DEMO_CONFIG) -> FastAPI:

@@ -7,7 +7,7 @@ from backend.ai_core.evaluate import evaluate_all_policies, summarize
 from backend.baseline.runner import EpisodeMetrics
 from backend.config import DEFAULT_CONFIG
 
-TRAINED_MODEL_PATH = Path("models/dqn_ev_dispatch.zip")
+TRAINED_MODEL_PATH = Path("models/dqn_osm_model.zip")
 
 
 def _make_metrics(**overrides) -> EpisodeMetrics:

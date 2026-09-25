@@ -7,7 +7,7 @@ multiple files (per PROJECT_SPEC.md section 44).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 @dataclass(frozen=True)
@@ -90,11 +90,20 @@ class SimulationConfig:
     # a station overload never terminates the whole episode; it is
     # discouraged through this configurable penalty instead.
     station_overload_penalty: float = -50.0
-    # Action rejects a station the EV cannot safely reach with its current
-    # battery (PROJECT_SPEC.md section 20). Same magnitude as
-    # battery_failure_penalty since picking it would have caused exactly
-    # that outcome; the environment prevents the attempt instead.
-    invalid_action_penalty: float = -1000.0
+    # Picking a station the EV cannot safely reach with its current battery
+    # (PROJECT_SPEC.md section 20). EVEnv overrides such a pick with the
+    # nearest reachable station (so the decision still resolves and time
+    # still advances) and adds this penalty on top of that trip's own cost.
+    # 10x battery_failure_penalty, so an invalid pick is never a cheaper
+    # "escape" than any real outcome, including stranding an EV.
+    invalid_action_penalty: float = -10000.0
+    # EVEnv.step() multiplies every reward by this before returning it
+    # (penalties above stay in their natural units here). Brings the
+    # -10000 invalid penalty down to -100 and a typical ~-200 trip cost to
+    # ~-2, a range where DQN's Huber loss can still tell apart the small
+    # differences between two valid stations instead of being dominated by
+    # the rare huge penalties.
+    reward_scale: float = 0.01
 
     # --- Reproducibility (PROJECT_SPEC.md section 26) ---
     random_seed: int = 42
@@ -126,3 +135,37 @@ class SimulationConfig:
 
 
 DEFAULT_CONFIG = SimulationConfig()
+
+# The real-OSM-map scenario the live demo runs AND the DQN is trained on
+# (Nghia Do extract, data/osm_nghia_do.graphml). Its one difference from
+# DEFAULT_CONFIG is a slow charging_rate: a full 0.0 -> 1.0 charge takes ~900
+# simulated ticks (~3 real minutes at the default UI speed of 5 ticks/sec),
+# so the battery bar visibly ticks up during a demo. ai_core/train.py uses
+# this exact config so the served model is trained on the same station-
+# occupancy dynamics it faces in the API -- a model trained on the fast
+# DEFAULT_CONFIG charging would badly underestimate how long stations stay
+# occupied here.
+#
+# Physics recalibrated for the real map (road distances run far longer than
+# straight-line distance across it), so that under the nearest_station
+# baseline no EV fails or is stranded purely because of the environment:
+# - battery_consumption_per_distance 1/5500: a full battery covers ~5.5 km
+#   (battery_capacity stays the normalized 1.0 -- low_battery_threshold and
+#   charging_rate are absolute battery units, so range is set here).
+# - low_battery_threshold 0.75: an EV asks for a station with ~4.1 km of
+#   range left. Measured over 200 seeds, the farthest any road node sits
+#   from its nearest (randomly placed) station is up to ~3.45 km of real
+#   road, so a lower threshold strands EVs no policy could save (0.2 left
+#   ~2 stranded per episode). 0.75 gave 0 stranded / 0 failed under
+#   nearest_station on 30 seeds with ~39 decisions per 50-EV episode; the
+#   alternative of 0.2 with a ~20 km range also reached 0 stranded but
+#   left only ~4 decisions per episode, too few to learn congestion from.
+# - max_episode_steps 20000: each charge takes ~900 ticks, so a 5000-tick
+#   cap truncated every episode before its EVs could finish.
+OSM_DEMO_CONFIG = replace(
+    DEFAULT_CONFIG,
+    charging_rate=1.0 / 900,
+    battery_consumption_per_distance=1.0 / 5500.0,
+    low_battery_threshold=0.75,
+    max_episode_steps=20_000,
+)

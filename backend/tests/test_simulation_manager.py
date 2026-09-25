@@ -12,7 +12,7 @@ from backend.config import DEFAULT_CONFIG
 from backend.simulation.vehicle import VehicleState
 
 SMALL_CONFIG = replace(DEFAULT_CONFIG, num_vehicles=5, max_episode_steps=800)
-TRAINED_MODEL_PATH = Path("models/dqn_ev_dispatch.zip")
+TRAINED_MODEL_PATH = Path("models/dqn_osm_model.zip")
 
 
 @pytest.fixture
@@ -69,13 +69,6 @@ def test_dqn_model_loading_does_not_block_status_requests(monkeypatch):
         return real_model
 
     monkeypatch.setattr(simulation_manager_module.DQN, "load", staticmethod(slow_load))
-    # RL is temporarily frozen out by default (Task 4 of the access-node/
-    # real-map refactor) -- a "dqn" request is silently downgraded before
-    # ever reaching _ensure_dqn_model_loaded(). This test is specifically
-    # about that loading-doesn't-block-other-requests mechanism, so it
-    # bypasses the freeze just for itself.
-    monkeypatch.setattr(simulation_manager_module, "RL_TEMPORARILY_DISABLED", False)
-
     config = replace(DEFAULT_CONFIG, num_vehicles=5, max_episode_steps=800)
     manager = SimulationManager(config)
     manager.start_background_thread()
@@ -162,3 +155,36 @@ def test_interpolate_position_reaches_the_depot_poi_node_once_completed(manager)
 
     expected = (simulator.graph.nodes[depot_node]["x"], simulator.graph.nodes[depot_node]["y"])
     assert _interpolate_position(simulator, vehicle) == expected
+
+
+class _CrashingModel:
+    def predict(self, obs, deterministic=True):
+        raise RuntimeError("simulated model crash")
+
+
+def test_dqn_predict_crash_falls_back_to_baseline_without_raising(manager):
+    manager.algorithm = "dqn"
+    manager._dqn_model = _CrashingModel()
+    vehicle_id = manager._info["next_vehicle_id"]
+
+    action = manager._choose_action()
+
+    expected = simulation_manager_module._BASELINE_POLICIES[
+        simulation_manager_module.DQN_FALLBACK_ALGORITHM
+    ](manager.env.simulator, vehicle_id)
+    assert action == expected
+
+
+def test_incompatible_dqn_model_is_rejected_at_load(monkeypatch, tmp_path):
+    from backend.ai_core.ev_env import EVEnv
+    from backend.ai_core.train import build_model
+
+    stale_config = replace(SMALL_CONFIG, num_stations=SMALL_CONFIG.num_stations + 1)
+    stale_path = tmp_path / "stale.zip"
+    build_model(EVEnv(stale_config), seed=0, net_arch=[8]).save(str(stale_path))
+    monkeypatch.setattr(simulation_manager_module, "DQN_MODEL_PATH", stale_path)
+
+    manager = SimulationManager(SMALL_CONFIG)
+    with pytest.raises(ValueError, match="observation shape"):
+        manager._ensure_dqn_model_loaded()
+    assert manager._dqn_model is None

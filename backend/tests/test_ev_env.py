@@ -6,6 +6,7 @@ from gymnasium.utils.env_checker import check_env
 
 from backend.ai_core.ev_env import EVEnv
 from backend.config import DEFAULT_CONFIG
+from backend.simulation.network_graph import get_station_nodes
 from backend.simulation.vehicle import Vehicle, VehicleState
 
 SMALL_CONFIG = replace(
@@ -22,7 +23,7 @@ def test_observation_and_action_space_shapes():
     env = EVEnv(SMALL_CONFIG)
 
     assert env.action_space.n == SMALL_CONFIG.num_stations
-    assert env.observation_space.shape == (5 + 5 * SMALL_CONFIG.num_stations,)
+    assert env.observation_space.shape == (5 + 7 * SMALL_CONFIG.num_stations,)
     assert env.observation_space.dtype == np.float32
 
 
@@ -71,7 +72,58 @@ def test_step_with_reachable_station_returns_valid_types():
     assert info2["invalid_action"] is False
 
 
-def test_step_with_unreachable_station_is_penalized_and_blocks_assignment():
+def _reset_with_one_reachable_and_one_unreachable_station(env):
+    """Returns (vehicle_id, reachable_station_id, unreachable_station_id)
+    after lowering the current EV's battery so exactly its nearest station
+    stays reachable."""
+    for seed in range(50):
+        _, info = env.reset(seed=seed)
+        vehicle_id = info["next_vehicle_id"]
+        energy = {sid: env.simulator.energy_required(vehicle_id, sid) for sid in env.simulator.stations}
+        near, far = sorted(energy, key=energy.get)[0], sorted(energy, key=energy.get)[-1]
+        if energy[far] - energy[near] > 1e-3:
+            vehicle = env.simulator.vehicles[vehicle_id]
+            vehicle.battery_level = (energy[near] + energy[far]) / 2
+            return vehicle_id, near, far
+    raise AssertionError("no seed with distinct station distances")
+
+
+def test_invalid_action_is_penalized_and_falls_back_to_nearest_reachable_station():
+    env = EVEnv(SMALL_CONFIG)
+    vehicle_id, reachable_id, unreachable_id = _reset_with_one_reachable_and_one_unreachable_station(env)
+
+    observation, reward, terminated, truncated, info = env.step(unreachable_id)
+
+    assert info["invalid_action"] is True
+    assert info["stranded"] is False
+    assert info["requested_station_id"] == unreachable_id
+    assert info["station_id"] == reachable_id
+    # The decision is resolved: the EV was dispatched, not left pending.
+    vehicle = env.simulator.vehicles[vehicle_id]
+    assert vehicle.state != VehicleState.TRAVELING or vehicle.target_station is not None
+    assert info["next_vehicle_id"] != vehicle_id or info["next_vehicle_id"] is None
+    outcome = -(
+        SMALL_CONFIG.reward_travel_weight * info["travel_time"]
+        + SMALL_CONFIG.reward_waiting_weight * info["waiting_time"]
+    ) + (SMALL_CONFIG.station_overload_penalty if info["station_overloaded"] else 0.0)
+    if info["vehicle_failed"]:
+        outcome = SMALL_CONFIG.battery_failure_penalty
+    assert reward == pytest.approx((outcome + SMALL_CONFIG.invalid_action_penalty) * SMALL_CONFIG.reward_scale)
+
+
+def test_invalid_action_always_scores_worse_than_choosing_the_fallback_directly():
+    env_invalid = EVEnv(SMALL_CONFIG)
+    _, reachable_id, unreachable_id = _reset_with_one_reachable_and_one_unreachable_station(env_invalid)
+    _, reward_invalid, *_ = env_invalid.step(unreachable_id)
+
+    env_direct = EVEnv(SMALL_CONFIG)
+    _reset_with_one_reachable_and_one_unreachable_station(env_direct)
+    _, reward_direct, *_ = env_direct.step(reachable_id)
+
+    assert reward_invalid == pytest.approx(reward_direct + SMALL_CONFIG.invalid_action_penalty * SMALL_CONFIG.reward_scale)
+
+
+def test_vehicle_with_no_reachable_station_is_stranded_not_counted_invalid():
     env = EVEnv(SMALL_CONFIG)
     obs, info = env.reset(seed=5)
     vehicle_id = info["next_vehicle_id"]
@@ -80,10 +132,37 @@ def test_step_with_unreachable_station_is_penalized_and_blocks_assignment():
 
     observation, reward, terminated, truncated, info2 = env.step(0)
 
-    assert info2["invalid_action"] is True
-    assert reward == SMALL_CONFIG.invalid_action_penalty
-    assert vehicle.target_station is None
-    assert terminated is False
+    assert info2["invalid_action"] is False
+    assert info2["stranded"] is True
+    assert info2["vehicle_failed"] is True
+    assert vehicle.state == VehicleState.FAILED
+    assert reward == pytest.approx(SMALL_CONFIG.battery_failure_penalty * SMALL_CONFIG.reward_scale)
+
+
+def test_worst_case_policy_resolves_each_ev_at_most_once():
+    # Regression: an unresolved invalid action used to leave the same EV
+    # frozen and pending, so a bad policy could rack up thousands of
+    # decisions in one episode. Every step now resolves one EV for good.
+    env = EVEnv(SMALL_CONFIG)
+    env.reset(seed=8)
+    num_decisions = 0
+    done = False
+    while not done:
+        _, _, terminated, truncated, _ = env.step(env.action_space.n - 1)
+        num_decisions += 1
+        done = terminated or truncated
+
+    assert num_decisions <= SMALL_CONFIG.num_vehicles
+
+
+def test_observation_is_finite_and_within_unit_box_across_an_episode():
+    env = EVEnv(SMALL_CONFIG)
+    obs, _ = env.reset(seed=9)
+    done = False
+    while not done:
+        assert np.all(np.isfinite(obs)) and obs.min() >= 0.0 and obs.max() <= 1.0
+        obs, _, terminated, truncated, _ = env.step(env.action_space.sample())
+        done = terminated or truncated
 
 
 def test_reward_matches_travel_and_waiting_time_formula():
@@ -109,7 +188,7 @@ def test_reward_matches_travel_and_waiting_time_formula():
     )
     if info2["station_overloaded"]:
         expected_reward += config.station_overload_penalty
-    assert reward == pytest.approx(expected_reward)
+    assert reward == pytest.approx(expected_reward * config.reward_scale)
 
 
 def test_station_overload_penalty_applied_without_terminating_episode():
@@ -234,3 +313,31 @@ def test_build_observation_works_for_an_arbitrary_non_current_vehicle():
 
     assert other_obs.shape == env.observation_space.shape
     assert env.observation_space.contains(other_obs)
+
+
+def test_observation_coordinates_are_scaled_to_map_bounding_box():
+    env = EVEnv(SMALL_CONFIG)
+    obs, info = env.reset(seed=4)
+    graph = env.simulator.graph
+    x_min, y_min, x_max, y_max = graph.graph["bounds"]
+    vehicle = env.simulator.vehicles[info["next_vehicle_id"]]
+    current = graph.nodes[vehicle.current_node]
+
+    assert obs[0] == pytest.approx((current["x"] - x_min) / (x_max - x_min), abs=1e-6)
+    assert obs[1] == pytest.approx((current["y"] - y_min) / (y_max - y_min), abs=1e-6)
+    for index, station_id in enumerate(sorted(env.simulator.stations)):
+        station_node = graph.nodes[env.simulator.stations[station_id].node_id]
+        offset = 5 + 7 * index
+        assert obs[offset] == pytest.approx((station_node["x"] - x_min) / (x_max - x_min), abs=1e-6)
+        assert obs[offset + 1] == pytest.approx((station_node["y"] - y_min) / (y_max - y_min), abs=1e-6)
+
+
+def test_action_index_maps_to_real_station_node():
+    env = EVEnv(SMALL_CONFIG)
+    env.reset(seed=4)
+    station_nodes = set(get_station_nodes(env.simulator.graph))
+
+    for action in range(env.action_space.n):
+        station_id = env.station_id_for_action(action)
+        assert env.simulator.stations[station_id].node_id in station_nodes
+    assert len({env.station_id_for_action(a) for a in range(env.action_space.n)}) == env.action_space.n

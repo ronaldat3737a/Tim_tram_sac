@@ -88,7 +88,7 @@ def test_episode_metrics_derived_properties():
         num_decisions=5,
         num_valid_decisions=4,
         num_invalid_actions=1,
-        num_failed_vehicles=0,
+        num_failed_vehicles=1,
         num_overloaded_events=0,
         total_travel_time=40.0,
         total_waiting_time=8.0,
@@ -96,6 +96,7 @@ def test_episode_metrics_derived_properties():
         terminated=True,
         truncated=False,
         simulation_time=100.0,
+        num_stranded_vehicles=1,
     )
 
     assert metrics.average_travel_time == pytest.approx(10.0)
@@ -103,14 +104,14 @@ def test_episode_metrics_derived_properties():
     assert metrics.total_system_cost == pytest.approx(48.0)
 
 
-def test_episode_metrics_derived_properties_handle_zero_valid_decisions():
+def test_episode_metrics_derived_properties_handle_zero_dispatched_decisions():
     metrics = EpisodeMetrics(
         policy_name="test",
         seed=0,
         num_decisions=1,
-        num_valid_decisions=0,
-        num_invalid_actions=1,
-        num_failed_vehicles=0,
+        num_valid_decisions=1,
+        num_invalid_actions=0,
+        num_failed_vehicles=1,
         num_overloaded_events=0,
         total_travel_time=0.0,
         total_waiting_time=0.0,
@@ -118,6 +119,7 @@ def test_episode_metrics_derived_properties_handle_zero_valid_decisions():
         terminated=False,
         truncated=True,
         simulation_time=5000.0,
+        num_stranded_vehicles=1,
     )
 
     assert metrics.average_travel_time == 0.0

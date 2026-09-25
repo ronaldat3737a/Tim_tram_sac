@@ -8,7 +8,7 @@ backend.ai_core.ev_env.EVEnv; nothing is fabricated or hard-coded (section 54).
 
 Run:
     python -m backend.ai_core.evaluate
-    python -m backend.ai_core.evaluate --model-path models/dqn_ev_dispatch.zip --seeds 1000 1001 1002
+    python -m backend.ai_core.evaluate --model-path models/dqn_osm_model.zip --seeds 1000 1001 1002
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from stable_baselines3 import DQN
 
 from backend.baseline import least_queue, nearest_station, shortest_time
 from backend.baseline.runner import ActionFn, EpisodeMetrics, run_baseline_episode, run_episode
-from backend.config import DEFAULT_CONFIG, SimulationConfig
+from backend.config import OSM_DEMO_CONFIG, SimulationConfig
 
 # A fixed, documented, held-out scenario set for fair comparison (sections
 # 29/30). Training (ai_core/train.py's RandomScenarioPerEpisode) draws
@@ -67,6 +67,7 @@ def summarize(metrics_list: list[EpisodeMetrics]) -> dict:
         "num_failed_vehicles_total": sum(m.num_failed_vehicles for m in metrics_list),
         "num_overloaded_events_total": sum(m.num_overloaded_events for m in metrics_list),
         "num_invalid_actions_total": sum(m.num_invalid_actions for m in metrics_list),
+        "num_stranded_vehicles_total": sum(m.num_stranded_vehicles for m in metrics_list),
         "episode_reward_mean": mean([m.episode_reward for m in metrics_list]),
         "episode_reward_stdev": stdev([m.episode_reward for m in metrics_list]),
         "terminated_count": sum(1 for m in metrics_list if m.terminated),
@@ -129,11 +130,11 @@ def print_comparison_table(summaries: dict[str, dict]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate DQN against baseline dispatch policies.")
-    parser.add_argument("--model-path", type=str, default="models/dqn_ev_dispatch.zip")
+    parser.add_argument("--model-path", type=str, default="models/dqn_osm_model.zip")
     parser.add_argument("--seeds", type=int, nargs="+", default=TEST_SEEDS)
     args = parser.parse_args()
 
-    summaries = evaluate_all_policies(DEFAULT_CONFIG, args.seeds, Path(args.model_path))
+    summaries = evaluate_all_policies(OSM_DEMO_CONFIG, args.seeds, Path(args.model_path))
 
     print(f"Evaluated on {len(args.seeds)} held-out test seeds: {args.seeds}\n")
     print_comparison_table(summaries)

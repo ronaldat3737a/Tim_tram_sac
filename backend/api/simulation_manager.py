@@ -16,6 +16,7 @@ practice, so this is a small, bounded, documented latency.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -31,17 +32,18 @@ from backend.simulation.network_graph import get_depot_access_nodes, get_station
 from backend.simulation.simulator import Simulator
 from backend.simulation.vehicle import VehicleState
 
+logger = logging.getLogger(__name__)
+
 IDLE_POLL_INTERVAL = 0.1
 DEFAULT_TICK_DELAY = 0.2
-DQN_MODEL_PATH = Path("models/dqn_ev_dispatch.zip")
+# Written by backend/ai_core/train.py (trained on OSM_DEMO_CONFIG).
+DQN_MODEL_PATH = Path("models/dqn_osm_model.zip")
 
-# Task 4 of the access-node/real-map refactor: RL is temporarily frozen out
-# while the new map/POI physics are validated against baselines only. Any
-# "dqn" request is silently downgraded to this baseline instead of loading/
-# running the (pre-refactor-trained, now stale) model -- remove this once
-# DQN is retrained against the new graph and re-validated.
-RL_TEMPORARILY_DISABLED = True
-FALLBACK_ALGORITHM_WHILE_RL_DISABLED = "nearest_station"
+# Baseline used whenever DQN can't be: no trained model on disk yet, a model
+# whose observation/action shape doesn't match this config, or predict()
+# raising mid-episode. The failure is logged and the simulation keeps going
+# rather than crashing the request or the background thread.
+DQN_FALLBACK_ALGORITHM = "nearest_station"
 
 _BASELINE_POLICIES = {
     "nearest_station": nearest_station.choose_station,
@@ -98,6 +100,7 @@ class _EpisodeAccumulator:
     num_valid_decisions: int = 0
     num_invalid_actions: int = 0
     num_overloaded_events: int = 0
+    num_stranded_vehicles: int = 0
     total_travel_time: float = 0.0
     total_waiting_time: float = 0.0
     episode_reward: float = 0.0
@@ -109,18 +112,29 @@ class _EpisodeAccumulator:
             self.num_invalid_actions += 1
         else:
             self.num_valid_decisions += 1
+        # An invalid pick still dispatches the EV (to EVEnv's fallback
+        # station), so its trip counts toward travel/waiting/overload too.
+        if info["stranded"]:
+            self.num_stranded_vehicles += 1
+        else:
             self.total_travel_time += info["travel_time"]
             self.total_waiting_time += info["waiting_time"]
             if info["station_overloaded"]:
                 self.num_overloaded_events += 1
 
     @property
+    def _num_dispatched_decisions(self) -> int:
+        return self.num_decisions - self.num_stranded_vehicles
+
+    @property
     def average_travel_time(self) -> float:
-        return self.total_travel_time / self.num_valid_decisions if self.num_valid_decisions else 0.0
+        n = self._num_dispatched_decisions
+        return self.total_travel_time / n if n else 0.0
 
     @property
     def average_waiting_time(self) -> float:
-        return self.total_waiting_time / self.num_valid_decisions if self.num_valid_decisions else 0.0
+        n = self._num_dispatched_decisions
+        return self.total_waiting_time / n if n else 0.0
 
     @property
     def total_system_cost(self) -> float:
@@ -214,14 +228,23 @@ class SimulationManager:
     # --- control (called from REST request handlers) -------------------
 
     def request_start(self, seed: int | None, algorithm: str, speed: float) -> None:
-        if RL_TEMPORARILY_DISABLED and algorithm == "dqn":
-            algorithm = FALLBACK_ALGORITHM_WHILE_RL_DISABLED
         if algorithm == "dqn":
             # Deserializing the model from disk can take a noticeable
             # fraction of a second; doing it while holding self._lock would
             # block status/pause/resume requests from other clients for
             # that whole time. Load it (once, cached) before taking the lock.
-            self._ensure_dqn_model_loaded()
+            try:
+                self._ensure_dqn_model_loaded()
+            except Exception:
+                # Run the fallback baseline instead, and report it as the
+                # active algorithm (get_status) so the dashboard never
+                # labels baseline results as DQN.
+                logger.exception(
+                    "could not load DQN model from %s; running %s instead",
+                    DQN_MODEL_PATH,
+                    DQN_FALLBACK_ALGORITHM,
+                )
+                algorithm = DQN_FALLBACK_ALGORITHM
         with self._lock:
             if algorithm is not None:
                 self._validate_algorithm_locked(algorithm)
@@ -370,23 +393,9 @@ class SimulationManager:
                     f"my car (vehicle {self.my_vehicle_id}) has no preview available "
                     f"right now (state={state_name})"
                 )
-            if self.algorithm == "dqn" and not RL_TEMPORARILY_DISABLED:
-                try:
-                    if self._dqn_model is None:
-                        raise RuntimeError("dqn model is not loaded")
-                    obs = self.env.build_observation(self.my_vehicle_id)
-                    action, _ = self._dqn_model.predict(obs, deterministic=True)
-                    candidate_station_id = int(action)
-                except Exception:
-                    # Task 4: never let a DQN failure surface as a crashed
-                    # request -- fall back to a baseline for this preview.
-                    candidate_station_id = _BASELINE_POLICIES[FALLBACK_ALGORITHM_WHILE_RL_DISABLED](
-                        simulator, self.my_vehicle_id
-                    )
-            else:
-                candidate_station_id = _BASELINE_POLICIES[
-                    self.algorithm if self.algorithm in _BASELINE_POLICIES else FALLBACK_ALGORITHM_WHILE_RL_DISABLED
-                ](simulator, self.my_vehicle_id)
+            candidate_station_id = self._choose_station_locked(
+                self.my_vehicle_id, lambda: self.env.build_observation(self.my_vehicle_id)
+            )
 
             station = simulator.stations[candidate_station_id]
             path, _, _ = shortest_path(
@@ -417,7 +426,7 @@ class SimulationManager:
         if algorithm == "dqn" and self._dqn_model is None:
             raise FileNotFoundError(
                 f"no trained DQN model at {DQN_MODEL_PATH}; run "
-                "`python -m backend.ai_core.train` first."
+                "`python backend/ai_core/train.py` first."
             )
 
     def _ensure_dqn_model_loaded(self) -> None:
@@ -427,9 +436,23 @@ class SimulationManager:
         if not DQN_MODEL_PATH.exists():
             raise FileNotFoundError(
                 f"no trained DQN model at {DQN_MODEL_PATH}; run "
-                "`python -m backend.ai_core.train` first."
+                "`python backend/ai_core/train.py` first."
             )
         model = DQN.load(str(DQN_MODEL_PATH))
+        # Catch a stale model (e.g. trained before the observation layout
+        # changed, or for a different num_stations) once here, instead of
+        # letting every single predict() call fail later.
+        expected_env = EVEnv(self.config)
+        if (
+            model.observation_space.shape != expected_env.observation_space.shape
+            or model.action_space.n != expected_env.action_space.n
+        ):
+            raise ValueError(
+                f"DQN model at {DQN_MODEL_PATH} expects observation shape "
+                f"{model.observation_space.shape} / {model.action_space.n} actions, but "
+                f"this config needs {expected_env.observation_space.shape} / "
+                f"{expected_env.action_space.n}; retrain with `python backend/ai_core/train.py`."
+            )
         with self._lock:
             if self._dqn_model is None:
                 self._dqn_model = model
@@ -477,20 +500,28 @@ class SimulationManager:
             time.sleep(delay)
 
     def _choose_action(self) -> int:
-        vehicle_id = self._info["next_vehicle_id"]
-        if self.algorithm == "dqn" and not RL_TEMPORARILY_DISABLED:
+        return self._choose_station_locked(self._info["next_vehicle_id"], lambda: self._obs)
+
+    def _choose_station_locked(self, vehicle_id: int, get_obs) -> int:
+        """Pick a station for vehicle_id with the active algorithm. For DQN,
+        any failure (model missing, predict() raising, an out-of-range
+        action) is logged and answered by DQN_FALLBACK_ALGORITHM instead, so
+        neither the background loop nor a preview request ever crashes.
+        get_obs is only called on the DQN path."""
+        if self.algorithm == "dqn":
             try:
-                action, _ = self._dqn_model.predict(self._obs, deterministic=True)
-                return int(action)
+                if self._dqn_model is None:
+                    raise RuntimeError("DQN model is not loaded")
+                action, _ = self._dqn_model.predict(get_obs(), deterministic=True)
+                return self.env.station_id_for_action(int(action))
             except Exception:
-                # Task 4: never let a DQN failure crash the background loop
-                # -- fall back to a baseline for this decision.
-                return _BASELINE_POLICIES[FALLBACK_ALGORITHM_WHILE_RL_DISABLED](
-                    self.env.simulator, vehicle_id
+                logger.exception(
+                    "DQN predict failed for vehicle %s; falling back to %s",
+                    vehicle_id,
+                    DQN_FALLBACK_ALGORITHM,
                 )
-        return _BASELINE_POLICIES[
-            self.algorithm if self.algorithm in _BASELINE_POLICIES else FALLBACK_ALGORITHM_WHILE_RL_DISABLED
-        ](self.env.simulator, vehicle_id)
+                return _BASELINE_POLICIES[DQN_FALLBACK_ALGORITHM](self.env.simulator, vehicle_id)
+        return _BASELINE_POLICIES[self.algorithm](self.env.simulator, vehicle_id)
 
     def _run_loop(self) -> None:
         while not self._shutdown_requested:

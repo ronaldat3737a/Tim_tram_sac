@@ -9,3 +9,4 @@ results/
 data/
 cache/
 .env
+logs/
