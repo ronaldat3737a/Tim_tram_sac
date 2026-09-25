@@ -8,13 +8,13 @@ by the simulator, so the env must never keep ticking while one is pending:
 an earlier version fast-forwarded until the dispatched EV started charging,
 which parked every other low-battery EV on the road for thousands of ticks.
 
-Reward is therefore settled incrementally: every step returns the decision's
-immediate penalties (invalid pick, overload) plus the travel/waiting time
-that ALL dispatched-but-unresolved EVs accrued during that step's interval,
-plus battery_failure_penalty for any of them that failed in it. Summed over
-an episode this equals the same total system cost the old per-decision
-reward measured; `info["resolved"]` reports each EV's final travel/waiting
-time once it starts charging or fails.
+Reward is a per-decision proxy cost (semi-MDP), charged to the step that
+made the decision and to nothing else: -(expected travel time to the chosen
+station + expected waiting time there), plus the invalid-pick and overload
+penalties. Expected waiting counts the EVs charging at, queued at or driving
+to that station, each taking one average charge time per charger. The EVs' real travel/
+waiting times are still tracked and reported in `info["resolved"]` once each
+one starts charging or fails; evaluation metrics use those, never the reward.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ from gymnasium import spaces
 from backend.config import DEFAULT_CONFIG, SimulationConfig
 from backend.simulation.network_graph import get_station_nodes, shortest_path
 from backend.simulation.simulator import Simulator
+from backend.simulation.traffic_logic import vehicle_effective_speed
 from backend.simulation.vehicle import VehicleState
 
 # Per station: normalized POI (x, y), distance, travel_time, queue, available
@@ -57,6 +58,11 @@ class EVEnv(gym.Env):
         obs_dim = _OBSERVATION_FIELDS_FOR_EGO + _OBSERVATION_FIELDS_PER_STATION * config.num_stations
         self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(obs_dim,), dtype=np.float32)
         self.action_space = spaces.Discrete(config.num_stations)
+        # Average time one EV occupies a charger: it asks for a station at
+        # low_battery_threshold and charges back to full.
+        self._expected_charge_time = (
+            config.battery_capacity - config.low_battery_threshold
+        ) / config.charging_rate
 
         self.simulator: Simulator | None = None
         self._current_vehicle_id: int | None = None
@@ -79,9 +85,8 @@ class EVEnv(gym.Env):
         # starving every other pending EV until truncation.
         self._pending_queue: deque[int] = deque()
         # Dispatched EVs still driving to / queueing at their station:
-        # vehicle_id -> {"station_id", "cost"}, where cost is the weighted
-        # travel+waiting time already charged to earlier steps' rewards.
-        self._in_flight: dict[int, dict[str, Any]] = {}
+        # vehicle_id -> station_id. Only used to report info["resolved"].
+        self._in_flight: dict[int, int] = {}
 
     def reset(
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
@@ -137,7 +142,7 @@ class EVEnv(gym.Env):
             # could have saved this EV, so it is not the agent's fault and
             # is not counted as an invalid action. It fails right here
             # instead of being left standing on the road.
-            vehicle.state = VehicleState.FAILED
+            self.simulator.fail_vehicle(vehicle)
             reward = self.config.battery_failure_penalty
             info.update(
                 station_id=None,
@@ -154,16 +159,18 @@ class EVEnv(gym.Env):
                 self._nearest_reachable_station(vehicle_id) if invalid_action else requested_station_id
             )
             station = self.simulator.stations[station_id]
-            # Overload is judged at decision time (current occupancy plus the
-            # EV about to join), matching the available-capacity feature the
-            # agent saw. The EV still drives all the way to the station and
-            # only joins its queue on physical arrival
-            # (Simulator._handle_arrival) -- it never waits remotely.
+            # Overload is judged at decision time (queued + charging + EVs
+            # already driving there, plus this one), matching the
+            # available-capacity feature the agent saw. The EV still drives
+            # all the way to the station and only joins its queue on physical
+            # arrival (Simulator._handle_arrival) -- it never waits remotely.
             overloaded = station.occupancy + 1 > station.capacity
+            # Priced before assign_station, so this EV is not counted among
+            # the ones ahead of it.
+            reward = -self._expected_dispatch_cost(vehicle_id, station_id)
             self.simulator.assign_station(vehicle_id, station_id)
-            self._in_flight[vehicle_id] = {"station_id": station_id, "cost": 0.0}
+            self._in_flight[vehicle_id] = station_id
 
-            reward = 0.0
             if invalid_action:
                 reward += self.config.invalid_action_penalty
             if overloaded:
@@ -177,9 +184,7 @@ class EVEnv(gym.Env):
             )
 
         terminated, truncated = self._advance_until_next_event()
-        interval_reward, resolved = self._settle_in_flight()
-        reward += interval_reward
-        info["resolved"] = resolved
+        info["resolved"] = self._collect_resolved()
         info["simulation_time"] = self.simulator.simulation_time
 
         if terminated or truncated:
@@ -193,35 +198,49 @@ class EVEnv(gym.Env):
         reward *= self.config.reward_scale
         return observation, float(reward), terminated, truncated, info
 
-    def _settle_in_flight(self) -> tuple[float, list[dict[str, Any]]]:
-        """Charge every in-flight EV's newly accrued travel/waiting time to
-        this step, and retire the ones that started charging (or failed)."""
-        reward = 0.0
+    def _expected_dispatch_cost(self, vehicle_id: int, station_id: int) -> float:
+        """Proxy cost of sending this EV to this station, known at decision
+        time: weighted expected travel time (its shortest route, driven at
+        its own traffic-limited speed, exactly as the simulator moves it)
+        plus expected waiting time: every EV ahead of it (charging, queued
+        or already driving there) takes one average charge, shared across
+        the station's chargers."""
+        graph = self.simulator.graph
+        vehicle = self.simulator.vehicles[vehicle_id]
+        station = self.simulator.stations[station_id]
+        path, _, _ = shortest_path(
+            graph, vehicle.current_node, station.node_id, weight=self.config.routing_weight
+        )
+        expected_travel_time = sum(
+            graph.edges[u, v]["distance"] / vehicle_effective_speed(graph, u, v, vehicle.speed)
+            for u, v in zip(path, path[1:])
+        )
+        evs_ahead = len(station.queue) + station.incoming_count + len(station.charging_vehicle_ids)
+        expected_waiting_time = evs_ahead / max(station.num_chargers, 1) * self._expected_charge_time
+        return (
+            self.config.reward_travel_weight * expected_travel_time
+            + self.config.reward_waiting_weight * expected_waiting_time
+        )
+
+    def _collect_resolved(self) -> list[dict[str, Any]]:
+        """Retire in-flight EVs that started charging (or failed) and report
+        their real travel/waiting times. Never feeds the reward."""
         resolved: list[dict[str, Any]] = []
-        for vehicle_id, record in list(self._in_flight.items()):
+        for vehicle_id, station_id in list(self._in_flight.items()):
             vehicle = self.simulator.vehicles[vehicle_id]
-            cost = (
-                self.config.reward_travel_weight * vehicle.time_since_station_assigned
-                + self.config.reward_waiting_weight * vehicle.waiting_time
-            )
-            reward -= cost - record["cost"]
-            record["cost"] = cost
             if vehicle.state in (VehicleState.TRAVELING, VehicleState.WAITING):
                 continue
-            failed = vehicle.state == VehicleState.FAILED
-            if failed:
-                reward += self.config.battery_failure_penalty
             resolved.append(
                 {
                     "vehicle_id": vehicle_id,
-                    "station_id": record["station_id"],
+                    "station_id": station_id,
                     "travel_time": vehicle.time_since_station_assigned,
                     "waiting_time": vehicle.waiting_time,
-                    "failed": failed,
+                    "failed": vehicle.state == VehicleState.FAILED,
                 }
             )
             del self._in_flight[vehicle_id]
-        return reward, resolved
+        return resolved
 
     def _nearest_reachable_station(self, vehicle_id: int) -> int:
         """Fallback for an invalid action: the reachable station with the

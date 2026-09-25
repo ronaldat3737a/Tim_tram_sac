@@ -142,6 +142,8 @@ class _EpisodeAccumulator:
 def build_snapshot(simulator: Simulator, config: SimulationConfig, tick_delay: float) -> dict:
     vehicles = []
     for vehicle in simulator.vehicles.values():
+        if not simulator.is_active(vehicle):
+            continue  # not departed yet: not on the map
         x, y = _interpolate_position(simulator, vehicle)
         station_id = None
         eta_seconds = None
@@ -292,7 +294,8 @@ class SimulationManager:
             }
             if self.env is not None:
                 for vehicle in self.env.simulator.vehicles.values():
-                    counts[vehicle.state.value] += 1
+                    if self.env.simulator.is_active(vehicle):
+                        counts[vehicle.state.value] += 1
             return {
                 "status": self.status,
                 "simulation_time": self.env.simulator.simulation_time if self.env else 0.0,
@@ -385,7 +388,7 @@ class SimulationManager:
                 raise RuntimeError("no active episode")
             simulator = self.env.simulator
             vehicle = simulator.vehicles.get(self.my_vehicle_id)
-            if vehicle is None or vehicle.state != VehicleState.TRAVELING:
+            if vehicle is None or vehicle.state != VehicleState.TRAVELING or not simulator.is_active(vehicle):
                 state_name = vehicle.state.value if vehicle else "unknown"
                 raise RuntimeError(
                     f"my car (vehicle {self.my_vehicle_id}) has no preview available "

@@ -19,14 +19,17 @@ class ChargingStation:
 
     queue: deque[int] = field(default_factory=deque)
     charging_vehicle_ids: set[int] = field(default_factory=set)
+    # EVs already dispatched here but still driving over. Maintained by the
+    # Simulator: +1 on assign_station, -1 on arrival or on failing en route.
+    incoming_count: int = 0
 
     @property
     def occupancy(self) -> int:
-        """Vehicles queued plus vehicles currently charging."""
-        return len(self.queue) + len(self.charging_vehicle_ids)
+        """Vehicles queued, charging, or already dispatched and on the way."""
+        return len(self.queue) + len(self.charging_vehicle_ids) + self.incoming_count
 
     def is_overloaded(self) -> bool:
-        """Overload = (queue + charging) > capacity (Phase 0 decision D.3)."""
+        """Overload = (queue + charging + incoming) > capacity (Phase 0 decision D.3)."""
         return self.occupancy > self.capacity
 
     def enqueue(self, vehicle_id: int) -> None:

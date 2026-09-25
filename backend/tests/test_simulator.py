@@ -31,6 +31,7 @@ def test_simulator_initial_vehicles_are_well_formed():
         assert vehicle.route[0] == vehicle.current_node
         assert vehicle.route[-1] == vehicle.destination_node
         assert SMALL_CONFIG.low_battery_threshold <= vehicle.battery_level <= SMALL_CONFIG.battery_capacity
+        assert vehicle.activation_tick == 0
 
 
 def test_simulator_reproducible_with_same_seed():
@@ -142,6 +143,7 @@ def test_needs_decision_vehicle_is_blocked_until_station_assigned():
 def test_assigned_vehicle_accumulates_travel_time_since_assignment():
     simulator = Simulator(SMALL_CONFIG, seed=9)
     vehicle = next(iter(simulator.vehicles.values()))
+    vehicle.battery_level = 1.0
     station_id = next(iter(simulator.stations))
     simulator.assign_station(vehicle.vehicle_id, station_id)
 
@@ -234,6 +236,8 @@ def test_waiting_vehicle_accumulates_waiting_time_while_queued():
 def test_vehicle_fails_when_battery_depletes_mid_edge():
     simulator = Simulator(SMALL_CONFIG, seed=19)
     u, v = max(simulator.graph.edges(), key=lambda e: simulator.graph.edges[e]["distance"])
+    station_id = next(iter(simulator.stations))
+    station = simulator.stations[station_id]
 
     vehicle = Vehicle(
         vehicle_id=300,
@@ -243,8 +247,9 @@ def test_vehicle_fails_when_battery_depletes_mid_edge():
         battery_capacity=SMALL_CONFIG.battery_capacity,
         speed=SMALL_CONFIG.max_speed,
         route=[u, v],
-        target_station=999,  # bypass needs_charging_decision blocking for this test
+        target_station=station_id,  # bypass needs_charging_decision blocking for this test
     )
+    station.incoming_count = 1  # as if assign_station had dispatched it
     config = replace(SMALL_CONFIG, battery_consumption_per_distance=1.0)
     simulator.config = config
     simulator.vehicles = {300: vehicle}
@@ -253,6 +258,38 @@ def test_vehicle_fails_when_battery_depletes_mid_edge():
 
     assert vehicle.state == VehicleState.FAILED
     assert vehicle.battery_level == 0.0
+    # A dead EV must not keep holding a slot at the station it never reached.
+    assert station.incoming_count == 0
+
+
+def test_incoming_count_tracks_dispatch_until_arrival():
+    simulator = Simulator(SMALL_CONFIG, seed=9)
+    vehicle = next(iter(simulator.vehicles.values()))
+    vehicle.battery_level = 1.0
+    station_id = next(iter(simulator.stations))
+    station = simulator.stations[station_id]
+
+    simulator.assign_station(vehicle.vehicle_id, station_id)
+
+    assert station.incoming_count == 1
+    assert station.occupancy == 1
+    while vehicle.state == VehicleState.TRAVELING:
+        simulator.tick()
+    assert vehicle.state in (VehicleState.WAITING, VehicleState.CHARGING)
+    assert station.incoming_count == 0
+
+
+def test_reassigning_an_en_route_vehicle_moves_its_incoming_slot():
+    simulator = Simulator(SMALL_CONFIG, seed=9)
+    vehicle = next(iter(simulator.vehicles.values()))
+    vehicle.battery_level = 1.0
+    first, second = list(simulator.stations)[:2]
+
+    simulator.assign_station(vehicle.vehicle_id, first)
+    simulator.assign_station(vehicle.vehicle_id, second)
+
+    assert simulator.stations[first].incoming_count == 0
+    assert simulator.stations[second].incoming_count == 1
 
 
 def test_is_station_reachable_true_when_battery_exceeds_required_energy():
@@ -395,3 +432,48 @@ def test_vehicle_on_road_with_empty_route_fails_instead_of_parking():
     simulator.tick()
 
     assert vehicle.state == VehicleState.FAILED
+
+
+STAGGERED_CONFIG = replace(SMALL_CONFIG, max_activation_tick=500)
+
+
+def test_staggered_activation_ticks_are_in_range_and_reproducible():
+    sim_a = Simulator(STAGGERED_CONFIG, seed=42)
+    sim_b = Simulator(STAGGERED_CONFIG, seed=42)
+
+    ticks = [v.activation_tick for v in sim_a.vehicles.values()]
+    assert all(0 <= t <= STAGGERED_CONFIG.max_activation_tick for t in ticks)
+    assert len(set(ticks)) > 1
+    assert ticks == [v.activation_tick for v in sim_b.vehicles.values()]
+
+
+def test_inactive_vehicle_is_frozen_until_its_activation_tick():
+    simulator = Simulator(STAGGERED_CONFIG, seed=42)
+    vehicle = next(iter(simulator.vehicles.values()))
+    vehicle.activation_tick = 3
+    # Low enough to need a decision the moment it is active.
+    vehicle.battery_level = STAGGERED_CONFIG.low_battery_threshold
+    node, battery, route = vehicle.current_node, vehicle.battery_level, list(vehicle.route)
+
+    for _ in range(3):
+        assert not simulator.is_active(vehicle)
+        assert vehicle not in simulator.get_vehicles_needing_decision()
+        simulator.tick()
+
+    assert vehicle.state == VehicleState.TRAVELING
+    assert (vehicle.current_node, vehicle.battery_level, vehicle.route) == (node, battery, route)
+    assert simulator.is_active(vehicle)
+    assert vehicle in simulator.get_vehicles_needing_decision()
+
+
+def test_inactive_vehicle_starts_moving_once_active():
+    simulator = Simulator(STAGGERED_CONFIG, seed=42)
+    vehicle = next(iter(simulator.vehicles.values()))
+    vehicle.activation_tick = 2
+    vehicle.battery_level = 1.0
+
+    simulator.tick()
+    simulator.tick()
+    assert vehicle.edge_progress == 0.0 and vehicle.battery_level == 1.0
+    simulator.tick()
+    assert vehicle.battery_level < 1.0

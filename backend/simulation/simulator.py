@@ -74,17 +74,39 @@ class Simulator:
             raise ValueError(
                 f"station {station_id} is not reachable for vehicle {vehicle_id}: no path exists"
             ) from exc
+        # Defensive: re-dispatching an EV already driving to another station
+        # hands its incoming slot back there first.
+        self._release_incoming(vehicle)
         vehicle.target_station = station_id
         vehicle.route = path
         vehicle.edge_progress = 0.0
+        station.incoming_count += 1
+
+    def fail_vehicle(self, vehicle: Vehicle) -> None:
+        """Mark an EV FAILED, freeing its incoming slot if it was still
+        driving to a station, so incoming_count never counts a dead EV."""
+        self._release_incoming(vehicle)
+        vehicle.state = VehicleState.FAILED
+
+    def _release_incoming(self, vehicle: Vehicle) -> None:
+        """Decrement incoming_count at the station this EV is driving to, if
+        any. An EV counts as incoming exactly while it is TRAVELING with a
+        target_station, so arrival and failure both end it."""
+        if vehicle.state == VehicleState.TRAVELING and vehicle.target_station is not None:
+            self.stations[vehicle.target_station].incoming_count -= 1
 
     def get_vehicles_needing_decision(self) -> list[Vehicle]:
         """EVs whose battery is low and have no charging station assigned yet."""
         return [
             vehicle
             for vehicle in self.vehicles.values()
-            if needs_charging_decision(vehicle, self.config)
+            if self.is_active(vehicle) and needs_charging_decision(vehicle, self.config)
         ]
+
+    def is_active(self, vehicle: Vehicle) -> bool:
+        """False until the EV's staggered departure tick: it has not joined
+        traffic yet."""
+        return self.simulation_time >= vehicle.activation_tick
 
     def all_vehicles_done(self) -> bool:
         return all(
@@ -122,6 +144,13 @@ class Simulator:
                 self.rng.uniform(self.config.low_battery_threshold, self.config.battery_capacity)
             )
             speed = float(self.rng.uniform(self.config.min_speed, self.config.max_speed))
+            # Drawn only when staggering is on, so scenarios with every EV
+            # departing at tick 0 keep their exact random stream.
+            activation_tick = (
+                int(self.rng.integers(0, self.config.max_activation_tick + 1))
+                if self.config.max_activation_tick > 0
+                else 0
+            )
             # Defensive: the graph is built as a single connected component,
             # so every node pair has a path in practice. If that ever fails
             # to hold, spawn this EV already at its destination (an
@@ -142,12 +171,15 @@ class Simulator:
                 battery_capacity=self.config.battery_capacity,
                 speed=speed,
                 route=path,
+                activation_tick=activation_tick,
             )
         return vehicles
 
     def _move_vehicles(self) -> None:
         for vehicle in self.vehicles.values():
             if vehicle.state not in (VehicleState.TRAVELING, VehicleState.RETURNING_TO_DEPOT):
+                continue
+            if not self.is_active(vehicle):
                 continue
             if needs_charging_decision(vehicle, self.config):
                 # Held in place until it is dispatched. EVEnv never ticks
@@ -160,7 +192,7 @@ class Simulator:
             if not vehicle.route:
                 # Defensive: a vehicle on the road with no route at all could
                 # never move again. Fail it instead of leaving it parked.
-                vehicle.state = VehicleState.FAILED
+                self.fail_vehicle(vehicle)
                 continue
             if len(vehicle.route) == 1:
                 # Already standing at the route's target node (e.g. a
@@ -177,7 +209,7 @@ class Simulator:
     def _drain_idle_battery(self, vehicle: Vehicle) -> None:
         vehicle.set_battery_level(vehicle.battery_level - self.config.idle_battery_drain_per_tick * self.config.time_step)
         if vehicle.battery_level <= 0.0:
-            vehicle.state = VehicleState.FAILED
+            self.fail_vehicle(vehicle)
 
     def _advance_vehicle_along_route(self, vehicle: Vehicle) -> None:
         movement_budget = self._movement_budget(vehicle)
@@ -195,7 +227,7 @@ class Simulator:
             movement_budget -= move
 
             if vehicle.battery_level <= 0.0:
-                vehicle.state = VehicleState.FAILED
+                self.fail_vehicle(vehicle)
                 return
 
             if vehicle.edge_progress >= edge["distance"] - _ARRIVAL_EPSILON:
@@ -213,6 +245,7 @@ class Simulator:
 
     def _handle_arrival(self, vehicle: Vehicle) -> None:
         if vehicle.target_station is not None:
+            self._release_incoming(vehicle)
             vehicle.state = VehicleState.WAITING
             self.stations[vehicle.target_station].enqueue(vehicle.vehicle_id)
         else:

@@ -45,6 +45,11 @@ class Vehicle:
     time_since_station_assigned: float = 0.0
     waiting_time: float = 0.0
 
+    # Tick at which this EV joins traffic (staggered departures). Before it,
+    # the Simulator leaves the EV untouched: no movement, no battery drain,
+    # no charging decision.
+    activation_tick: float = 0.0
+
     def set_battery_level(self, value: float) -> None:
         self.battery_level = min(max(value, 0.0), self.battery_capacity)
 

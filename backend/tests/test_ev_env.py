@@ -158,7 +158,7 @@ def test_observation_is_finite_and_within_unit_box_across_an_episode():
         done = terminated or truncated
 
 
-def test_reward_matches_travel_and_waiting_time_formula():
+def test_reward_is_expected_waiting_for_queued_and_incoming_evs():
     config = replace(DEFAULT_CONFIG, num_stations=2, num_vehicles=1)
     env = EVEnv(config)
     obs, info = env.reset(seed=3)
@@ -167,24 +167,72 @@ def test_reward_matches_travel_and_waiting_time_formula():
     station_id = next(iter(env.simulator.stations))
     station = env.simulator.stations[station_id]
 
+    # Standing at the station: zero expected travel time.
     vehicle.current_node = station.node_id
     vehicle.battery_level = 1.0
+    filler = Vehicle(
+        vehicle_id=901,
+        current_node=station.node_id,
+        destination_node=station.node_id,
+        battery_level=1.0,
+        battery_capacity=config.battery_capacity,
+        speed=config.max_speed,
+        target_station=station_id,
+        state=VehicleState.WAITING,
+        route=[station.node_id],
+    )
+    env.simulator.vehicles[901] = filler
+    station.queue.append(901)
+    station.incoming_count = 1
 
     observation, reward, terminated, truncated, info2 = env.step(station_id)
 
-    # The only EV, so this one step runs until its trip resolves.
-    assert info2["invalid_action"] is False
-    [trip] = info2["resolved"]
-    assert trip["vehicle_id"] == vehicle_id and trip["failed"] is False
+    charge_time = (config.battery_capacity - config.low_battery_threshold) / config.charging_rate
+    # 1 queued + 1 incoming, shared across the station's 2 chargers.
+    assert station.num_chargers == 2
+    assert info2["station_overloaded"] is False
+    assert reward == pytest.approx(-config.reward_waiting_weight * charge_time * config.reward_scale)
+    # The real outcome is still reported, independently of the reward.
+    [trip] = [t for t in info2["resolved"] if t["vehicle_id"] == vehicle_id]
+    assert trip["failed"] is False
     assert trip["travel_time"] == pytest.approx(0.0)
     assert trip["waiting_time"] == pytest.approx(config.time_step)
-    expected_reward = -(
-        config.reward_travel_weight * trip["travel_time"]
-        + config.reward_waiting_weight * trip["waiting_time"]
+
+
+def test_expected_waiting_counts_evs_already_charging():
+    config = replace(DEFAULT_CONFIG, num_stations=2, num_vehicles=1)
+    env = EVEnv(config)
+    _, info = env.reset(seed=3)
+    vehicle_id = info["next_vehicle_id"]
+    station_id = next(iter(env.simulator.stations))
+    station = env.simulator.stations[station_id]
+    env.simulator.vehicles[vehicle_id].current_node = station.node_id  # zero travel
+
+    # Both chargers busy, nobody queued or on the way: one charge turn.
+    station.charging_vehicle_ids.update({901, 902})
+
+    charge_time = (config.battery_capacity - config.low_battery_threshold) / config.charging_rate
+    assert env._expected_dispatch_cost(vehicle_id, station_id) == pytest.approx(
+        config.reward_waiting_weight * charge_time
     )
-    if info2["station_overloaded"]:
-        expected_reward += config.station_overload_penalty
-    assert reward == pytest.approx(expected_reward * config.reward_scale)
+
+
+def test_expected_travel_time_matches_the_simulated_trip():
+    config = replace(DEFAULT_CONFIG, num_stations=2, num_vehicles=1)
+    env = EVEnv(config)
+    _, info = env.reset(seed=3)
+    vehicle_id = info["next_vehicle_id"]
+    env.simulator.vehicles[vehicle_id].battery_level = 1.0
+    station_id = max(env.simulator.stations, key=lambda s: env.simulator.energy_required(vehicle_id, s))
+
+    _, reward, _, _, info2 = env.step(station_id)
+
+    expected_travel = -reward / (config.reward_scale * config.reward_travel_weight)
+    [trip] = info2["resolved"]
+    assert expected_travel > 0.0
+    # The simulator moves in whole ticks, so the real trip can overshoot the
+    # continuous estimate by up to a tick per edge boundary.
+    assert trip["travel_time"] == pytest.approx(expected_travel, rel=0.1, abs=5 * config.time_step)
 
 
 def test_station_overload_penalty_applied_without_terminating_episode():
@@ -269,10 +317,10 @@ def test_tick_hook_is_called_once_per_simulator_tick():
     ticks_after_reset = tick_count
     assert ticks_after_reset == env.simulator.simulation_time
 
-    vehicle_id = info["next_vehicle_id"]
-    reachable = [s for s in range(config.num_stations) if env.simulator.is_station_reachable(vehicle_id, s)]
-    action = reachable[0] if reachable else 0
-    env.step(action)
+    done = False
+    while not done:
+        _, _, terminated, truncated, _ = env.step(env.action_space.sample())
+        done = terminated or truncated
 
     assert tick_count > ticks_after_reset
     assert tick_count == env.simulator.simulation_time
@@ -377,29 +425,58 @@ def test_step_returns_without_ticking_when_another_ev_is_already_pending():
     _, _, _, _, info2 = env.step(0)
 
     assert env.simulator.simulation_time == time_before
-    assert info2["next_vehicle_id"] == other.vehicle_id
+    next_vehicle = env.simulator.vehicles[info2["next_vehicle_id"]]
+    assert next_vehicle in env.simulator.get_vehicles_needing_decision()
 
 
-def test_episode_reward_totals_all_travel_and_waiting_time():
-    config = replace(SMALL_CONFIG, station_overload_penalty=0.0)
+def test_each_step_reward_prices_only_its_own_decision():
+    config = SMALL_CONFIG
     env = EVEnv(config)
-    env.reset(seed=8)
-    total_reward = 0.0
-    trips = []
-    penalties = 0.0
+    _, info = env.reset(seed=8)
+    dispatched, resolved = [], []
     done = False
     while not done:
+        vehicle_id = info["next_vehicle_id"]
+        costs = {
+            sid: env._expected_dispatch_cost(vehicle_id, sid)
+            for sid in env._station_ids
+            if env.simulator.is_station_reachable(vehicle_id, sid)
+        }
         _, reward, terminated, truncated, info = env.step(env.action_space.sample())
-        total_reward += reward
-        trips += info["resolved"]
-        penalties += config.invalid_action_penalty * info["invalid_action"]
-        penalties += config.battery_failure_penalty * info["stranded"]
+        if info["stranded"]:
+            expected = config.battery_failure_penalty
+        else:
+            dispatched.append(info["vehicle_id"])
+            expected = (
+                -costs[info["station_id"]]
+                + config.invalid_action_penalty * info["invalid_action"]
+                + config.station_overload_penalty * info["station_overloaded"]
+            )
+        assert reward == pytest.approx(expected * config.reward_scale)
+        resolved += [t["vehicle_id"] for t in info["resolved"]]
         done = terminated or truncated
 
-    assert terminated and not env._in_flight  # every dispatched trip resolved
-    expected = penalties + sum(
-        -(config.reward_travel_weight * t["travel_time"] + config.reward_waiting_weight * t["waiting_time"])
-        + (config.battery_failure_penalty if t["failed"] else 0.0)
-        for t in trips
-    )
-    assert total_reward == pytest.approx(expected * config.reward_scale)
+    # Every dispatched trip is still reported exactly once for evaluation,
+    # and no station is left counting an EV that is no longer on its way.
+    assert terminated and not env._in_flight
+    assert sorted(resolved) == sorted(dispatched)
+    assert all(station.incoming_count == 0 for station in env.simulator.stations.values())
+
+
+def test_staggered_episode_spreads_decisions_and_resolves_every_trip():
+    config = replace(SMALL_CONFIG, max_activation_tick=1500)
+    env = EVEnv(config)
+    _, info = env.reset(seed=8)
+    decision_times, dispatched, resolved = [], [], []
+    done = False
+    while not done:
+        decision_times.append(info["simulation_time"])
+        _, _, terminated, truncated, info = env.step(env.action_space.sample())
+        if not info["stranded"]:
+            dispatched.append(info["vehicle_id"])
+        resolved += [t["vehicle_id"] for t in info["resolved"]]
+        done = terminated or truncated
+
+    assert terminated
+    assert max(decision_times) - min(decision_times) > 500
+    assert sorted(resolved) == sorted(dispatched)

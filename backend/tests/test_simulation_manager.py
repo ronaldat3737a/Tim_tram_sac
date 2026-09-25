@@ -7,8 +7,9 @@ import pytest
 from stable_baselines3 import DQN
 
 from backend.api import simulation_manager as simulation_manager_module
-from backend.api.simulation_manager import SimulationManager, _interpolate_position
+from backend.api.simulation_manager import SimulationManager, _interpolate_position, build_snapshot
 from backend.config import DEFAULT_CONFIG
+from backend.simulation.simulator import Simulator
 from backend.simulation.vehicle import VehicleState
 
 SMALL_CONFIG = replace(DEFAULT_CONFIG, num_vehicles=5, max_episode_steps=800)
@@ -188,3 +189,17 @@ def test_incompatible_dqn_model_is_rejected_at_load(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="observation shape"):
         manager._ensure_dqn_model_loaded()
     assert manager._dqn_model is None
+
+
+def test_snapshot_leaves_out_vehicles_that_have_not_departed_yet():
+    simulator = Simulator(replace(SMALL_CONFIG, max_activation_tick=100), seed=1)
+    vehicles = list(simulator.vehicles.values())
+    for vehicle in vehicles:
+        vehicle.activation_tick = 0
+    vehicles[0].activation_tick = 50
+
+    snapshot = build_snapshot(simulator, simulator.config, tick_delay=0.0)
+
+    ids = {v["id"] for v in snapshot["vehicles"]}
+    assert vehicles[0].vehicle_id not in ids
+    assert ids == {v.vehicle_id for v in vehicles[1:]}

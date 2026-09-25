@@ -78,6 +78,10 @@ class SimulationConfig:
     # typical urban speed costs. Never applies inside a station (queued or
     # charging).
     idle_battery_drain_per_tick: float = 0.0001
+    # Staggered departures: each EV joins traffic at a random tick in
+    # [0, max_activation_tick]; before that it does not move, drain battery
+    # or ask for a decision. 0 = every EV departs at tick 0.
+    max_activation_tick: int = 0
 
     # --- Charging station (PROJECT_SPEC.md section 12) ---
     # capacity is the total number of slots at a station, i.e.
@@ -167,10 +171,15 @@ DEFAULT_CONFIG = SimulationConfig()
 #   left only ~4 decisions per episode, too few to learn congestion from.
 # - max_episode_steps 20000: each charge takes ~900 ticks, so a 5000-tick
 #   cap truncated every episode before its EVs could finish.
+# - max_activation_tick 8000: a full battery only drives ~180 ticks before
+#   reaching the 0.75 threshold, so with every EV departing at tick 0 all
+#   decisions landed in the first ~300 ticks. Staggering departures spreads
+#   them over the episode.
 OSM_DEMO_CONFIG = replace(
     DEFAULT_CONFIG,
     charging_rate=1.0 / 900,
     battery_consumption_per_distance=1.0 / 5500.0,
     low_battery_threshold=0.75,
     max_episode_steps=20_000,
+    max_activation_tick=8_000,
 )
