@@ -2,7 +2,9 @@
 
 Runs EVEnv in a background thread (never inside a request handler, and never
 training -- section 36), stepping through decisions with the selected policy
-(a baseline or a loaded, already-trained DQN model). EVEnv's tick_hook
+(a baseline or a loaded, already-trained DQN model). MAPPO runs
+MultiAgentEVEnv instead, dispatching a whole decision batch per step with
+the trained shared actor. The env's tick_hook
 (added in Phase 6 for evaluation metrics) is reused here to publish a
 dynamic-state snapshot after every simulated second, so WebSocket clients see
 smooth per-second updates even though env.step() itself resolves one whole
@@ -22,10 +24,13 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 from shapely.geometry import LineString
 from stable_baselines3 import DQN
 
 from backend.ai_core.ev_env import EVEnv
+from backend.ai_core.mappo import MAPPOAgent
+from backend.ai_core.marl_env import MultiAgentEVEnv
 from backend.baseline import least_queue, nearest_station, shortest_time
 from backend.config import SimulationConfig
 from backend.simulation.network_graph import get_depot_access_nodes, get_station_access_nodes, shortest_path
@@ -44,6 +49,14 @@ DQN_MODEL_PATH = Path("models/dqn_osm_model.zip")
 # raising mid-episode. The failure is logged and the simulation keeps going
 # rather than crashing the request or the background thread.
 DQN_FALLBACK_ALGORITHM = "nearest_station"
+
+# Written by backend/ai_core/train_mappo.py (trained on OSM_DEMO_CONFIG).
+# Unlike DQN, a missing or incompatible MAPPO model is reported to the UI
+# (400) rather than silently replaced by a baseline.
+MAPPO_MODEL_PATH = Path("models/mappo_osm_model.pth")
+# Used only if the checkpoint does not record the window it was trained
+# with (train_mappo.DECISION_WINDOW).
+MAPPO_DEFAULT_DECISION_WINDOW = 15
 
 _BASELINE_POLICIES = {
     "nearest_station": nearest_station.choose_station,
@@ -107,6 +120,11 @@ class _EpisodeAccumulator:
     episode_reward: float = 0.0
 
     def record(self, reward: float, info: dict) -> None:
+        """One EVEnv step: its decision plus the trips it resolved."""
+        self.record_decision(reward, info)
+        self.record_resolved(info["resolved"])
+
+    def record_decision(self, reward: float, info: dict) -> None:
         self.num_decisions += 1
         self.episode_reward += reward
         if info["invalid_action"]:
@@ -117,9 +135,11 @@ class _EpisodeAccumulator:
             self.num_stranded_vehicles += 1
         if info["station_overloaded"]:
             self.num_overloaded_events += 1
-        # Trips (including invalid picks sent to EVEnv's fallback station)
-        # that resolved -- started charging or failed -- during this step.
-        for trip in info["resolved"]:
+
+    def record_resolved(self, trips: list[dict]) -> None:
+        # Trips (including invalid picks sent to the env's fallback station)
+        # that resolved -- started charging or failed -- during a step.
+        for trip in trips:
             self.num_resolved_dispatches += 1
             self.total_travel_time += trip["travel_time"]
             self.total_waiting_time += trip["waiting_time"]
@@ -198,11 +218,14 @@ class SimulationManager:
         self.tick_delay = DEFAULT_TICK_DELAY
         self.episode_seed = config.random_seed
 
-        self.env: EVEnv | None = None
+        self.env: EVEnv | MultiAgentEVEnv | None = None
+        # EVEnv: the pending EV's observation. MultiAgentEVEnv: a dict of
+        # observations, one per agent of the current decision batch.
         self._obs = None
         self._info: dict = {}
         self._latest_snapshot: dict | None = None
         self._dqn_model: DQN | None = None
+        self._mappo_model: MAPPOAgent | None = None
         self._episode_metrics = _EpisodeAccumulator()
         # A single EV highlighted as "my car" in the UI (picked fresh, from
         # the episode's own seeded RNG, on every reset/start). Only ever read
@@ -219,7 +242,7 @@ class SimulationManager:
 
     def start_background_thread(self) -> None:
         with self._lock:
-            self._reset_episode_locked(self.episode_seed)
+            self._reset_episode_locked(self.episode_seed, self.algorithm)
             self.status = "paused"
         self._thread.start()
 
@@ -229,7 +252,11 @@ class SimulationManager:
     # --- control (called from REST request handlers) -------------------
 
     def request_start(self, seed: int | None, algorithm: str, speed: float) -> None:
-        if algorithm == "dqn":
+        if algorithm == "mappo":
+            # Loaded before taking the lock, like DQN below. Raises
+            # (-> 400) if there is no usable trained model.
+            self._ensure_mappo_model_loaded()
+        elif algorithm == "dqn":
             # Deserializing the model from disk can take a noticeable
             # fraction of a second; doing it while holding self._lock would
             # block status/pause/resume requests from other clients for
@@ -254,7 +281,7 @@ class SimulationManager:
             # only commit seed/algorithm/speed/status once it succeeds, so a
             # rejected request leaves every field exactly as it was rather
             # than partially applied (section 43).
-            self._reset_episode_locked(resolved_seed)
+            self._reset_episode_locked(resolved_seed, algorithm if algorithm is not None else self.algorithm)
             self.episode_seed = resolved_seed
             if algorithm is not None:
                 self.algorithm = algorithm
@@ -275,7 +302,7 @@ class SimulationManager:
     def request_reset(self, seed: int | None) -> None:
         with self._lock:
             resolved_seed = seed if seed is not None else self.episode_seed
-            self._reset_episode_locked(resolved_seed)
+            self._reset_episode_locked(resolved_seed, self.algorithm)
             self.episode_seed = resolved_seed
             self.status = "paused"
 
@@ -423,8 +450,13 @@ class SimulationManager:
     # --- internal --------------------------------------------------------
 
     def _validate_algorithm_locked(self, algorithm: str) -> None:
-        if algorithm not in _BASELINE_POLICIES and algorithm != "dqn":
+        if algorithm not in _BASELINE_POLICIES and algorithm not in ("dqn", "mappo"):
             raise ValueError(f"unknown algorithm {algorithm!r}")
+        if algorithm == "mappo" and self._mappo_model is None:
+            raise FileNotFoundError(
+                f"no trained MAPPO model at {MAPPO_MODEL_PATH}; run "
+                "`python backend/ai_core/train_mappo.py` first."
+            )
         if algorithm == "dqn" and self._dqn_model is None:
             raise FileNotFoundError(
                 f"no trained DQN model at {DQN_MODEL_PATH}; run "
@@ -459,13 +491,43 @@ class SimulationManager:
             if self._dqn_model is None:
                 self._dqn_model = model
 
+    def _ensure_mappo_model_loaded(self) -> None:
+        with self._lock:
+            if self._mappo_model is not None:
+                return
+        if not MAPPO_MODEL_PATH.exists():
+            raise FileNotFoundError(
+                f"no trained MAPPO model at {MAPPO_MODEL_PATH}; run "
+                "`python backend/ai_core/train_mappo.py` first."
+            )
+        model = MAPPOAgent.load(MAPPO_MODEL_PATH)
+        # Catch a stale model (different observation layout or station
+        # count) once here, instead of failing every inference later.
+        expected_env = MultiAgentEVEnv(self.config)
+        expected = (
+            expected_env.observation_space(0).shape[0],
+            expected_env.state_space.shape[0],
+            int(expected_env.action_space(0).n),
+        )
+        if (model.obs_dim, model.state_dim, model.num_actions) != expected:
+            raise ValueError(
+                f"MAPPO model at {MAPPO_MODEL_PATH} expects (obs_dim, state_dim, actions) = "
+                f"{(model.obs_dim, model.state_dim, model.num_actions)}, but this config needs "
+                f"{expected}; retrain with `python backend/ai_core/train_mappo.py`."
+            )
+        model.actor.eval()
+        model.critic.eval()
+        with self._lock:
+            if self._mappo_model is None:
+                self._mappo_model = model
+
     def _set_speed_locked(self, speed: float) -> None:
         if speed <= 0:
             raise ValueError("speed must be positive")
         self.tick_delay = 1.0 / speed
 
-    def _reset_episode_locked(self, seed: int) -> None:
-        new_env = EVEnv(self.config, tick_hook=self._on_tick)
+    def _reset_episode_locked(self, seed: int, algorithm: str) -> None:
+        new_env = self._make_env(algorithm)
         # env.reset() can raise (e.g. a scenario/seed where no EV in it ever
         # needs a decision -- ai_core/ev_env.py's own documented guard). Only
         # commit to self.env/_obs/_info/_latest_snapshot once it actually
@@ -486,6 +548,12 @@ class SimulationManager:
         # "My car" is an app user, never a non-app EV the policy cannot dispatch.
         app_vehicle_ids = [vid for vid, v in self.env.simulator.vehicles.items() if not v.is_non_app]
         self.my_vehicle_id = int(self.env.simulator.rng.choice(app_vehicle_ids))
+
+    def _make_env(self, algorithm: str) -> EVEnv | MultiAgentEVEnv:
+        if algorithm == "mappo":
+            window = self._mappo_model.metadata.get("decision_window", MAPPO_DEFAULT_DECISION_WINDOW)
+            return MultiAgentEVEnv(self.config, tick_hook=self._on_tick, decision_window=window)
+        return EVEnv(self.config, tick_hook=self._on_tick)
 
     def _on_tick(self, simulator: Simulator) -> None:
         # A concurrent reset/start can replace self.env while this exact
@@ -511,7 +579,18 @@ class SimulationManager:
         any failure (model missing, predict() raising, an out-of-range
         action) is logged and answered by DQN_FALLBACK_ALGORITHM instead, so
         neither the background loop nor a preview request ever crashes.
-        get_obs is only called on the DQN path."""
+        get_obs is only called on the DQN/MAPPO paths."""
+        if self.algorithm == "mappo":
+            try:
+                actions, _ = self._mappo_model.get_action(get_obs(), deterministic=True)
+                return self.env.station_id_for_action(int(actions[0]))
+            except Exception:
+                logger.exception(
+                    "MAPPO inference failed for vehicle %s; falling back to %s",
+                    vehicle_id,
+                    DQN_FALLBACK_ALGORITHM,
+                )
+                return _BASELINE_POLICIES[DQN_FALLBACK_ALGORITHM](self.env.simulator, vehicle_id)
         if self.algorithm == "dqn":
             try:
                 if self._dqn_model is None:
@@ -527,6 +606,25 @@ class SimulationManager:
                 return _BASELINE_POLICIES[DQN_FALLBACK_ALGORITHM](self.env.simulator, vehicle_id)
         return _BASELINE_POLICIES[self.algorithm](self.env.simulator, vehicle_id)
 
+    def _choose_batch_actions_locked(self) -> dict[int, int]:
+        """MAPPO: one forward pass of the shared actor over every agent of
+        the current decision batch (a batch of one is just a 1-row tensor),
+        argmax per agent. If inference fails the batch is dispatched by
+        DQN_FALLBACK_ALGORITHM instead, so the background loop never
+        crashes."""
+        agents = list(self.env.agents)
+        try:
+            actions, _ = self._mappo_model.get_action(
+                np.stack([self._obs[agent] for agent in agents]), deterministic=True
+            )
+            return {agent: int(action) for agent, action in zip(agents, actions)}
+        except Exception:
+            logger.exception("MAPPO inference failed; falling back to %s", DQN_FALLBACK_ALGORITHM)
+            policy = _BASELINE_POLICIES[DQN_FALLBACK_ALGORITHM]
+            return {
+                agent: self.env.action_for_station_id(policy(self.env.simulator, agent)) for agent in agents
+            }
+
     def _run_loop(self) -> None:
         while not self._shutdown_requested:
             with self._lock:
@@ -536,16 +634,39 @@ class SimulationManager:
                 time.sleep(IDLE_POLL_INTERVAL)
                 continue
 
-            with self._lock:
-                action = self._choose_action()
+            if isinstance(env, MultiAgentEVEnv):
+                self._step_multi_agent(env)
+            else:
+                self._step_single_agent(env)
 
-            obs, reward, terminated, truncated, info = env.step(action)
+    def _step_single_agent(self, env: EVEnv) -> None:
+        with self._lock:
+            action = self._choose_action()
 
-            with self._lock:
-                if env is not self.env:
-                    # A reset happened concurrently; discard this stale result.
-                    continue
-                self._obs, self._info = obs, info
-                self._episode_metrics.record(reward, info)
-                if terminated or truncated:
-                    self.status = "paused"
+        obs, reward, terminated, truncated, info = env.step(action)
+
+        with self._lock:
+            if env is not self.env:
+                # A reset happened concurrently; discard this stale result.
+                return
+            self._obs, self._info = obs, info
+            self._episode_metrics.record(reward, info)
+            if terminated or truncated:
+                self.status = "paused"
+
+    def _step_multi_agent(self, env: MultiAgentEVEnv) -> None:
+        with self._lock:
+            actions = self._choose_batch_actions_locked()
+
+        obs, rewards, _, _, infos = env.step(actions)
+
+        with self._lock:
+            if env is not self.env:
+                # A reset happened concurrently; discard this stale result.
+                return
+            self._obs = obs
+            for agent in actions:
+                self._episode_metrics.record_decision(rewards[agent], infos[agent])
+            self._episode_metrics.record_resolved(env.last_resolved)
+            if not env.agents:
+                self.status = "paused"

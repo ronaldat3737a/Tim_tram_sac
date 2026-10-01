@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-Algorithm = Literal["nearest_station", "shortest_time", "least_queue", "dqn"]
+Algorithm = Literal["nearest_station", "shortest_time", "least_queue", "dqn", "mappo"]
 SimulationStatus = Literal["stopped", "running", "paused"]
 
 

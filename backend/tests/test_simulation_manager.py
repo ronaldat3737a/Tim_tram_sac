@@ -203,3 +203,77 @@ def test_snapshot_leaves_out_vehicles_that_have_not_departed_yet():
     ids = {v["id"] for v in snapshot["vehicles"]}
     assert vehicles[0].vehicle_id not in ids
     assert ids == {v.vehicle_id for v in vehicles[1:]}
+
+
+def _mappo_manager(monkeypatch, tmp_path, config=SMALL_CONFIG):
+    from backend.ai_core.train_mappo import build_agent
+
+    model_path = tmp_path / "mappo.pth"
+    build_agent(config, hidden_sizes=(8,)).save(model_path, decision_window=5)
+    monkeypatch.setattr(simulation_manager_module, "MAPPO_MODEL_PATH", model_path)
+    manager = SimulationManager(config)
+    manager.request_speed(10_000.0)  # negligible pacing sleep per tick
+    manager._ensure_mappo_model_loaded()
+    with manager._lock:
+        manager._reset_episode_locked(seed=3, algorithm="mappo")
+        manager.algorithm = "mappo"
+    return manager
+
+
+def test_mappo_batch_actions_cover_every_agent_including_a_batch_of_one(monkeypatch, tmp_path):
+    manager = _mappo_manager(monkeypatch, tmp_path)
+    for _ in range(50):
+        if not manager.env.agents:
+            break
+        actions = manager._choose_batch_actions_locked()
+        assert set(actions) == set(manager.env.agents)
+        assert all(0 <= a < SMALL_CONFIG.num_stations for a in actions.values())
+        manager._step_multi_agent(manager.env)
+
+    assert manager._episode_metrics.num_decisions > 0
+
+
+class _CrashingMAPPO:
+    metadata = {}
+
+    def get_action(self, obs, deterministic=False):
+        raise RuntimeError("simulated model crash")
+
+
+def test_mappo_inference_crash_falls_back_to_baseline_without_raising(monkeypatch, tmp_path):
+    manager = _mappo_manager(monkeypatch, tmp_path)
+    manager._mappo_model = _CrashingMAPPO()
+
+    actions = manager._choose_batch_actions_locked()
+
+    policy = simulation_manager_module._BASELINE_POLICIES[simulation_manager_module.DQN_FALLBACK_ALGORITHM]
+    assert actions == {
+        agent: manager.env.action_for_station_id(policy(manager.env.simulator, agent))
+        for agent in manager.env.agents
+    }
+
+
+def test_my_car_preview_works_under_mappo(monkeypatch, tmp_path):
+    manager = _mappo_manager(monkeypatch, tmp_path)
+    vehicle = manager.env.simulator.vehicles[manager.my_vehicle_id]
+    vehicle.activation_tick = 0
+    vehicle.state = VehicleState.TRAVELING
+
+    preview = manager.get_my_car_preview()
+
+    assert 0 <= preview["station_id"] < SMALL_CONFIG.num_stations
+    assert preview["route"]
+
+
+def test_incompatible_mappo_model_is_rejected_at_load(monkeypatch, tmp_path):
+    from backend.ai_core.train_mappo import build_agent
+
+    stale_config = replace(SMALL_CONFIG, num_stations=SMALL_CONFIG.num_stations + 1)
+    stale_path = tmp_path / "stale.pth"
+    build_agent(stale_config, hidden_sizes=(8,)).save(stale_path)
+    monkeypatch.setattr(simulation_manager_module, "MAPPO_MODEL_PATH", stale_path)
+
+    manager = SimulationManager(SMALL_CONFIG)
+    with pytest.raises(ValueError, match="obs_dim"):
+        manager._ensure_mappo_model_loaded()
+    assert manager._mappo_model is None

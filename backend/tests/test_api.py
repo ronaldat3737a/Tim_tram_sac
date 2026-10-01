@@ -139,6 +139,49 @@ def test_start_with_dqn_but_no_trained_model_falls_back_to_baseline(monkeypatch,
     assert response.json()["algorithm"] == simulation_manager_module.DQN_FALLBACK_ALGORITHM
 
 
+def _save_untrained_mappo_model(path, config):
+    from backend.ai_core.train_mappo import build_agent
+
+    build_agent(config, hidden_sizes=(8,)).save(path, decision_window=5)
+    return path
+
+
+def test_start_with_mappo_but_no_trained_model_returns_400(monkeypatch, tmp_path):
+    # No silent baseline fallback for MAPPO: the UI gets the reason instead.
+    monkeypatch.setattr(simulation_manager_module, "MAPPO_MODEL_PATH", tmp_path / "missing.pth")
+
+    with TestClient(create_app(TEST_CONFIG)) as client:
+        response = client.post("/api/simulation/start", json={"algorithm": "mappo", "speed": FAST_SPEED})
+        status = client.get("/api/simulation/status").json()
+
+    assert response.status_code == 400
+    assert "train_mappo.py" in response.json()["detail"]
+    assert status["algorithm"] == "nearest_station"
+
+
+def test_start_with_mappo_runs_the_multi_agent_env(monkeypatch, tmp_path):
+    from backend.ai_core.marl_env import MultiAgentEVEnv
+
+    model_path = _save_untrained_mappo_model(tmp_path / "mappo.pth", TEST_CONFIG)
+    monkeypatch.setattr(simulation_manager_module, "MAPPO_MODEL_PATH", model_path)
+
+    with TestClient(create_app(TEST_CONFIG)) as client:
+        response = client.post(
+            "/api/simulation/start", json={"seed": 5, "algorithm": "mappo", "speed": FAST_SPEED}
+        )
+        manager = client.app.state.manager
+        assert isinstance(manager.env, MultiAgentEVEnv)
+        assert manager.env.decision_window == 5  # read from the checkpoint
+        deadline = time.time() + 10
+        while client.get("/api/simulation/status").json()["num_decisions"] == 0 and time.time() < deadline:
+            time.sleep(0.05)
+        status = client.get("/api/simulation/status").json()
+
+    assert response.status_code == 200
+    assert response.json()["algorithm"] == "mappo"
+    assert status["num_decisions"] > 0
+
+
 def test_speed_endpoint_updates_reported_speed():
     with TestClient(create_app(TEST_CONFIG)) as client:
         response = client.post("/api/simulation/speed", json={"speed": 10.0})

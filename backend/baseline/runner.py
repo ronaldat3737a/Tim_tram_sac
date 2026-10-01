@@ -82,6 +82,10 @@ class EpisodeMetrics:
     # Dispatched EVs whose trip resolved (started charging, or failed) before
     # the episode ended -- the ones total_travel/waiting_time cover.
     num_resolved_dispatches: int = 0
+    # Time EVs stood waiting for a dispatch decision (MAPPO's decision
+    # window; always 0 under EVEnv, which dispatches on the tick an EV runs
+    # low). Already included in total_waiting_time; kept here to show it.
+    total_decision_delay: float = 0.0
 
     @property
     def average_travel_time(self) -> float:

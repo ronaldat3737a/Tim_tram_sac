@@ -6,7 +6,8 @@ export type Algorithm =
   | "nearest_station"
   | "shortest_time"
   | "least_queue"
-  | "dqn";
+  | "dqn"
+  | "mappo";
 
 export type SimulationStatus = "stopped" | "running" | "paused";
 

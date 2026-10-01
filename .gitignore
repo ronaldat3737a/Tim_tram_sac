@@ -5,6 +5,7 @@ __pycache__/
 node_modules/
 .next/
 models/**/*.zip
+models/**/*.pth
 results/
 data/
 cache/

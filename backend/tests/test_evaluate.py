@@ -1,6 +1,7 @@
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from backend.ai_core.evaluate import evaluate_all_policies, summarize
@@ -87,3 +88,80 @@ def test_evaluate_all_policies_runs_end_to_end_with_trained_model():
         assert summary["policy_name"] == name
         assert summary["num_test_seeds"] == 2
         assert summary["terminated_count"] + summary["truncated_count"] == 2
+
+
+MARL_CONFIG = replace(
+    DEFAULT_CONFIG,
+    num_stations=2,
+    num_vehicles=15,
+    max_episode_steps=3000,
+    max_activation_tick=500,
+    peak_hour_fraction=0.6,
+    non_app_fraction=0.2,
+)
+
+
+def _untrained_mappo(config=MARL_CONFIG):
+    from backend.ai_core.train_mappo import build_agent
+
+    return build_agent(config, hidden_sizes=(8,))
+
+
+def test_mappo_waiting_time_includes_each_vehicles_decision_delay():
+    from backend.ai_core.evaluate import run_mappo_episode
+
+    agent = _untrained_mappo()
+    windowed = run_mappo_episode(MARL_CONFIG, seed=3, agent=agent, decision_window=15)
+
+    assert windowed.num_decisions > 0 and windowed.num_resolved_dispatches > 0
+    assert windowed.total_decision_delay > 0
+    # Every resolved trip carries its own delay, at most one full window.
+    assert windowed.total_decision_delay <= 15 * windowed.num_resolved_dispatches
+    assert windowed.total_waiting_time >= windowed.total_decision_delay
+
+    tick_exact = run_mappo_episode(MARL_CONFIG, seed=3, agent=agent, decision_window=0)
+    assert tick_exact.total_decision_delay == 0
+
+
+def test_mappo_episode_metrics_match_a_manual_rollout():
+    from backend.ai_core.evaluate import run_mappo_episode
+    from backend.ai_core.marl_env import MultiAgentEVEnv
+
+    agent = _untrained_mappo()
+    metrics = run_mappo_episode(MARL_CONFIG, seed=4, agent=agent, decision_window=15)
+
+    env = MultiAgentEVEnv(MARL_CONFIG, decision_window=15)
+    obs, _ = env.reset(seed=4)
+    delays, waits, decisions = {}, 0.0, 0
+    while env.agents:
+        agents = list(env.agents)
+        actions, _ = agent.get_action(np.stack([obs[a] for a in agents]), deterministic=True)
+        obs, _, _, _, infos = env.step(dict(zip(agents, actions.tolist())))
+        decisions += len(agents)
+        delays.update({a: infos[a]["decision_delay"] for a in agents})
+        waits += sum(t["waiting_time"] + delays[t["vehicle_id"]] for t in env.last_resolved)
+
+    assert metrics.num_decisions == decisions
+    assert metrics.total_waiting_time == pytest.approx(waits)
+    assert metrics.average_waiting_time == pytest.approx(waits / metrics.num_resolved_dispatches)
+
+
+def test_ev_env_policies_report_zero_decision_delay():
+    from backend.baseline import nearest_station
+    from backend.baseline.runner import run_baseline_episode
+
+    metrics = run_baseline_episode(MARL_CONFIG, 3, nearest_station.choose_station, "nearest_station")
+
+    assert metrics.total_decision_delay == 0.0
+
+
+def test_load_mappo_model_rejects_missing_or_incompatible_models(tmp_path):
+    from backend.ai_core.evaluate import load_mappo_model
+
+    with pytest.raises(FileNotFoundError):
+        load_mappo_model(MARL_CONFIG, tmp_path / "missing.pth")
+
+    stale = tmp_path / "stale.pth"
+    _untrained_mappo(replace(MARL_CONFIG, num_stations=3)).save(stale)
+    with pytest.raises(ValueError):
+        load_mappo_model(MARL_CONFIG, stale)

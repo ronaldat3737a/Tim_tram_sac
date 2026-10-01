@@ -13,6 +13,7 @@ const ALGORITHMS: { value: Algorithm; label: string }[] = [
   { value: "shortest_time", label: "Shortest Travel Time" },
   { value: "least_queue", label: "Least Queue" },
   { value: "dqn", label: "DQN (trained model)" },
+  { value: "mappo", label: "MAPPO (Multi-Agent RL)" },
 ];
 
 interface ControlPanelProps {

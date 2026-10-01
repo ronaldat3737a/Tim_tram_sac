@@ -8,13 +8,10 @@ by the simulator, so the env must never keep ticking while one is pending:
 an earlier version fast-forwarded until the dispatched EV started charging,
 which parked every other low-battery EV on the road for thousands of ticks.
 
-Reward is a per-decision proxy cost (semi-MDP), charged to the step that
-made the decision and to nothing else: -(expected travel time to the chosen
-station + expected waiting time there), plus the invalid-pick and overload
-penalties. Expected waiting counts the EVs charging at, queued at or driving
-to that station, each taking one average charge time per charger. The EVs' real travel/
-waiting times are still tracked and reported in `info["resolved"]` once each
-one starts charging or fails; evaluation metrics use those, never the reward.
+Reward is the per-decision semi-MDP proxy cost described in dispatch_core.
+The EVs' real travel/waiting times are still reported in `info["resolved"]`
+once each one starts charging or fails; evaluation metrics use those, never
+the reward.
 """
 
 from __future__ import annotations
@@ -26,18 +23,9 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
+from backend.ai_core.dispatch_core import DispatchContext, observation_dim
 from backend.config import DEFAULT_CONFIG, SimulationConfig
-from backend.simulation.network_graph import get_station_nodes, shortest_path
 from backend.simulation.simulator import Simulator
-from backend.simulation.traffic_logic import vehicle_effective_speed
-from backend.simulation.vehicle import VehicleState
-
-# Per station: normalized POI (x, y), distance, travel_time, queue, available
-# capacity, path traffic. Station positions are re-drawn per scenario seed
-# (network_graph._pick_access_nodes), so they are real information, not a
-# constant the network could ignore.
-_OBSERVATION_FIELDS_PER_STATION = 7
-_OBSERVATION_FIELDS_FOR_EGO = 5
 
 
 class EVEnv(gym.Env):
@@ -55,28 +43,14 @@ class EVEnv(gym.Env):
         # queue/occupancy history. None by default: no effect on behavior.
         self._tick_hook = tick_hook
 
-        obs_dim = _OBSERVATION_FIELDS_FOR_EGO + _OBSERVATION_FIELDS_PER_STATION * config.num_stations
-        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(obs_dim,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(observation_dim(config),), dtype=np.float32)
         self.action_space = spaces.Discrete(config.num_stations)
-        # Average time one EV occupies a charger: it asks for a station at
-        # low_battery_threshold and charges back to full.
-        self._expected_charge_time = (
-            config.battery_capacity - config.low_battery_threshold
-        ) / config.charging_rate
 
         self.simulator: Simulator | None = None
+        # Observation features, reward pricing and dispatch for the current
+        # episode. Set in reset().
+        self._context: DispatchContext | None = None
         self._current_vehicle_id: int | None = None
-        self._max_distance: float = 1.0
-        self._max_travel_time: float = 1.0
-        # Real OSM coordinates are raw (lng, lat) around (105.8, 21.0) that
-        # only vary in the 3rd-4th decimal place across the map; fed raw they
-        # would be near-constant, huge-magnitude inputs to the Q-network.
-        # Every coordinate feature is min-max scaled to [0, 1] against the
-        # map's own bounding box, (x_min, y_min, x_max, y_max), set in reset().
-        self._bounds: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
-        # action index -> station_id, in the same order the observation lists
-        # stations. Set in reset() from the simulator's real stations.
-        self._station_ids: list[int] = []
         # Round-robin queue over EVs currently needing a decision. Without
         # this, always taking get_vehicles_needing_decision()[0] would let a
         # single vehicle whose best station is persistently unreachable (a
@@ -84,9 +58,17 @@ class EVEnv(gym.Env):
         # it) monopolize every remaining decision slot in the episode,
         # starving every other pending EV until truncation.
         self._pending_queue: deque[int] = deque()
-        # Dispatched EVs still driving to / queueing at their station:
-        # vehicle_id -> station_id. Only used to report info["resolved"].
-        self._in_flight: dict[int, int] = {}
+
+    @property
+    def _station_ids(self) -> list[int]:
+        """action index -> station_id, in the same order the observation
+        lists stations."""
+        return self._context.station_ids
+
+    @property
+    def _in_flight(self) -> dict[int, int]:
+        """Dispatched EVs still driving to / queueing at their station."""
+        return self._context.in_flight
 
     def reset(
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
@@ -95,16 +77,8 @@ class EVEnv(gym.Env):
         resolved_seed = seed if seed is not None else self.config.random_seed
 
         self.simulator = Simulator(self.config, seed=resolved_seed)
-        self._bounds = self.simulator.graph.graph["bounds"]
-        self._station_ids = sorted(self.simulator.stations)
-        if len(self._station_ids) != self.action_space.n:
-            raise RuntimeError(
-                f"simulator built {len(self._station_ids)} stations but action_space "
-                f"expects {self.action_space.n} (config.num_stations)"
-            )
-        self._max_distance, self._max_travel_time = self._compute_normalization_constants()
+        self._context = DispatchContext(self.simulator, self.config)
         self._pending_queue = deque()
-        self._in_flight = {}
 
         terminated, truncated = self._advance_until_next_event()
         if terminated or truncated:
@@ -128,63 +102,15 @@ class EVEnv(gym.Env):
             raise ValueError(f"action {action} outside action_space {self.action_space}")
 
         vehicle_id = self._current_vehicle_id
-        vehicle = self.simulator.vehicles[vehicle_id]
-        requested_station_id = self.station_id_for_action(action)
-
         info: dict[str, Any] = {
             "vehicle_id": vehicle_id,
-            "requested_station_id": requested_station_id,
+            "requested_station_id": self.station_id_for_action(action),
         }
-        if not any(
-            self.simulator.is_station_reachable(vehicle_id, sid) for sid in self._station_ids
-        ):
-            # No station is reachable with the remaining battery: no action
-            # could have saved this EV, so it is not the agent's fault and
-            # is not counted as an invalid action. It fails right here
-            # instead of being left standing on the road.
-            self.simulator.fail_vehicle(vehicle)
-            reward = self.config.battery_failure_penalty
-            info.update(
-                station_id=None,
-                station_node_id=None,
-                invalid_action=False,
-                stranded=True,
-                station_overloaded=False,
-            )
-        else:
-            invalid_action = not self.simulator.is_station_reachable(vehicle_id, requested_station_id)
-            # An unreachable pick is overridden by the nearest reachable
-            # station, so the EV is still dispatched and drives off at once.
-            station_id = (
-                self._nearest_reachable_station(vehicle_id) if invalid_action else requested_station_id
-            )
-            station = self.simulator.stations[station_id]
-            # Overload is judged at decision time (queued + charging + EVs
-            # already driving there, plus this one), matching the
-            # available-capacity feature the agent saw. The EV still drives
-            # all the way to the station and only joins its queue on physical
-            # arrival (Simulator._handle_arrival) -- it never waits remotely.
-            overloaded = station.occupancy + 1 > station.capacity
-            # Priced before assign_station, so this EV is not counted among
-            # the ones ahead of it.
-            reward = -self._expected_dispatch_cost(vehicle_id, station_id)
-            self.simulator.assign_station(vehicle_id, station_id)
-            self._in_flight[vehicle_id] = station_id
-
-            if invalid_action:
-                reward += self.config.invalid_action_penalty
-            if overloaded:
-                reward += self.config.station_overload_penalty
-            info.update(
-                station_id=station_id,
-                station_node_id=station.node_id,
-                invalid_action=invalid_action,
-                stranded=False,
-                station_overloaded=overloaded,
-            )
+        reward, dispatch_info = self._context.dispatch(vehicle_id, info["requested_station_id"])
+        info.update(dispatch_info)
 
         terminated, truncated = self._advance_until_next_event()
-        info["resolved"] = self._collect_resolved()
+        info["resolved"] = self._context.collect_resolved()
         info["simulation_time"] = self.simulator.simulation_time
 
         if terminated or truncated:
@@ -199,57 +125,7 @@ class EVEnv(gym.Env):
         return observation, float(reward), terminated, truncated, info
 
     def _expected_dispatch_cost(self, vehicle_id: int, station_id: int) -> float:
-        """Proxy cost of sending this EV to this station, known at decision
-        time: weighted expected travel time (its shortest route, driven at
-        its own traffic-limited speed, exactly as the simulator moves it)
-        plus expected waiting time: every EV ahead of it (charging, queued
-        or already driving there) takes one average charge, shared across
-        the station's chargers."""
-        graph = self.simulator.graph
-        vehicle = self.simulator.vehicles[vehicle_id]
-        station = self.simulator.stations[station_id]
-        path, _, _ = shortest_path(
-            graph, vehicle.current_node, station.node_id, weight=self.config.routing_weight
-        )
-        expected_travel_time = sum(
-            graph.edges[u, v]["distance"] / vehicle_effective_speed(graph, u, v, vehicle.speed)
-            for u, v in zip(path, path[1:])
-        )
-        evs_ahead = len(station.queue) + station.incoming_count + len(station.charging_vehicle_ids)
-        expected_waiting_time = evs_ahead / max(station.num_chargers, 1) * self._expected_charge_time
-        return (
-            self.config.reward_travel_weight * expected_travel_time
-            + self.config.reward_waiting_weight * expected_waiting_time
-        )
-
-    def _collect_resolved(self) -> list[dict[str, Any]]:
-        """Retire in-flight EVs that started charging (or failed) and report
-        their real travel/waiting times. Never feeds the reward."""
-        resolved: list[dict[str, Any]] = []
-        for vehicle_id, station_id in list(self._in_flight.items()):
-            vehicle = self.simulator.vehicles[vehicle_id]
-            if vehicle.state in (VehicleState.TRAVELING, VehicleState.WAITING):
-                continue
-            resolved.append(
-                {
-                    "vehicle_id": vehicle_id,
-                    "station_id": station_id,
-                    "travel_time": vehicle.time_since_station_assigned,
-                    "waiting_time": vehicle.waiting_time,
-                    "failed": vehicle.state == VehicleState.FAILED,
-                }
-            )
-            del self._in_flight[vehicle_id]
-        return resolved
-
-    def _nearest_reachable_station(self, vehicle_id: int) -> int:
-        """Fallback for an invalid action: the reachable station with the
-        shortest road distance (same notion of "nearest" as the
-        nearest_station baseline). Caller guarantees one is reachable."""
-        reachable = [
-            sid for sid in self._station_ids if self.simulator.is_station_reachable(vehicle_id, sid)
-        ]
-        return min(reachable, key=lambda sid: self.simulator.energy_required(vehicle_id, sid))
+        return self._context.expected_dispatch_cost(vehicle_id, station_id)
 
     def station_id_for_action(self, action: int) -> int:
         """Map a Discrete action index (0..num_stations-1) to the real
@@ -281,20 +157,6 @@ class EVEnv(gym.Env):
         self._pending_queue.extend(newly_eligible)
         return self._pending_queue.popleft()
 
-    def _compute_normalization_constants(self) -> tuple[float, float]:
-        graph = self.simulator.graph
-        station_nodes = get_station_nodes(graph)
-        max_distance = 0.0
-        max_travel_time = 0.0
-        for node in graph.nodes():
-            for station_node in station_nodes:
-                _, distance, travel_time = shortest_path(
-                    graph, node, station_node, weight=self.config.routing_weight
-                )
-                max_distance = max(max_distance, distance)
-                max_travel_time = max(max_travel_time, travel_time)
-        return max(max_distance, 1e-6), max(max_travel_time, 1e-6)
-
     def build_observation(self, vehicle_id: int) -> np.ndarray:
         """Public accessor for the same normalized observation reset()/step()
         use internally, for an arbitrary vehicle_id -- not just whichever one
@@ -305,56 +167,4 @@ class EVEnv(gym.Env):
         return self._build_observation(vehicle_id)
 
     def _build_observation(self, vehicle_id: int) -> np.ndarray:
-        graph = self.simulator.graph
-        vehicle = self.simulator.vehicles[vehicle_id]
-
-        current = graph.nodes[vehicle.current_node]
-        destination = graph.nodes[vehicle.destination_node]
-
-        features = [
-            *self._normalize_xy(current["x"], current["y"]),
-            vehicle.battery_level / vehicle.battery_capacity,
-            *self._normalize_xy(destination["x"], destination["y"]),
-        ]
-
-        for station_id in self._station_ids:
-            station = self.simulator.stations[station_id]
-            station_node = graph.nodes[station.node_id]
-            path, distance, travel_time = shortest_path(
-                graph, vehicle.current_node, station.node_id, weight=self.config.routing_weight
-            )
-            queue_norm = min(len(station.queue) / station.capacity, 1.0)
-            available_norm = min(max(station.capacity - station.occupancy, 0) / station.capacity, 1.0)
-            traffic_norm = min(self._average_path_traffic_weight(graph, path) / self.config.max_traffic_weight, 1.0)
-
-            features.extend(
-                [
-                    *self._normalize_xy(station_node["x"], station_node["y"]),
-                    min(distance / self._max_distance, 1.0),
-                    min(travel_time / self._max_travel_time, 1.0),
-                    queue_norm,
-                    available_norm,
-                    traffic_norm,
-                ]
-            )
-
-        # Every feature above is already scaled into [0, 1] by construction;
-        # this is a last-line guard so a NaN/inf or any out-of-range outlier
-        # can never reach the Q-network, whatever its source.
-        observation = np.nan_to_num(np.array(features, dtype=np.float32), nan=0.0, posinf=1.0, neginf=0.0)
-        return np.clip(observation, 0.0, 1.0)
-
-    def _normalize_xy(self, x: float, y: float) -> tuple[float, float]:
-        """Min-max scale a real (lng, lat) into [0, 1] x [0, 1] using the
-        map's bounding box (see self._bounds)."""
-        x_min, y_min, x_max, y_max = self._bounds
-        x_norm = (x - x_min) / max(x_max - x_min, 1e-9)
-        y_norm = (y - y_min) / max(y_max - y_min, 1e-9)
-        return min(max(x_norm, 0.0), 1.0), min(max(y_norm, 0.0), 1.0)
-
-    @staticmethod
-    def _average_path_traffic_weight(graph, path: list[int]) -> float:
-        if len(path) < 2:
-            return 0.0
-        weights = [graph.edges[u, v]["traffic_weight"] for u, v in zip(path, path[1:])]
-        return sum(weights) / len(weights)
+        return self._context.build_observation(vehicle_id)
