@@ -171,6 +171,7 @@ def test_websocket_streams_simulation_update_matching_schema():
         vehicle = message["vehicles"][0]
         assert set(vehicle) == {
             "id", "node", "x", "y", "battery", "state", "station_id", "eta_seconds", "depot_id",
+            "is_non_app",
         }
     if message["stations"]:
         station = message["stations"][0]

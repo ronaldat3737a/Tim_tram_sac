@@ -167,6 +167,7 @@ def build_snapshot(simulator: Simulator, config: SimulationConfig, tick_delay: f
                 "station_id": station_id,
                 "eta_seconds": eta_seconds,
                 "depot_id": depot_id,
+                "is_non_app": vehicle.is_non_app,
             }
         )
     stations = [
@@ -482,7 +483,9 @@ class SimulationManager:
         self._obs, self._info = obs, info
         self._latest_snapshot = build_snapshot(self.env.simulator, self.config, self.tick_delay)
         self._episode_metrics = _EpisodeAccumulator()
-        self.my_vehicle_id = int(self.env.simulator.rng.choice(list(self.env.simulator.vehicles)))
+        # "My car" is an app user, never a non-app EV the policy cannot dispatch.
+        app_vehicle_ids = [vid for vid, v in self.env.simulator.vehicles.items() if not v.is_non_app]
+        self.my_vehicle_id = int(self.env.simulator.rng.choice(app_vehicle_ids))
 
     def _on_tick(self, simulator: Simulator) -> None:
         # A concurrent reset/start can replace self.env while this exact

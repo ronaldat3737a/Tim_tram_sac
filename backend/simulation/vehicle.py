@@ -50,6 +50,10 @@ class Vehicle:
     # no charging decision.
     activation_tick: float = 0.0
 
+    # Exogenous noise: a driver not using the app. The Simulator dispatches
+    # it to a random station on its own; it never reaches the agent.
+    is_non_app: bool = False
+
     def set_battery_level(self, value: float) -> None:
         self.battery_level = min(max(value, 0.0), self.battery_capacity)
 

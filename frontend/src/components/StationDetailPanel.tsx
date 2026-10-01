@@ -78,7 +78,10 @@ export default function StationDetailPanel({ station, liveStation, vehicles }: S
                 key={v.id}
                 className="flex items-center justify-between gap-2 rounded-md border border-gray-100 px-2 py-1.5 text-xs dark:border-gray-800"
               >
-                <span className="font-medium">EV {v.id}</span>
+                <span className="font-medium">
+                  EV {v.id}
+                  {v.is_non_app && <span className="ml-1 text-orange-600">(Non-App)</span>}
+                </span>
                 <span className="flex items-center gap-1 text-emerald-600">
                   <Battery className="h-3.5 w-3.5" /> {(v.battery * 100).toFixed(0)}%
                 </span>
@@ -103,6 +106,7 @@ export default function StationDetailPanel({ station, liveStation, vehicles }: S
                 className="rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-700 dark:bg-amber-900 dark:text-amber-300"
               >
                 EV {v.id}
+                {v.is_non_app ? " (Non-App)" : ""}
               </span>
             ))}
           </div>

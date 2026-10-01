@@ -80,6 +80,9 @@ export interface VehicleUpdate {
   eta_seconds: number | null;
   // Populated only while state is RETURNING_TO_DEPOT.
   depot_id: number | null;
+  // Non-app EV (exogenous noise): the simulator sends it to a random
+  // station on its own; the dispatch policy never controls it.
+  is_non_app: boolean;
 }
 
 export interface StationUpdate {

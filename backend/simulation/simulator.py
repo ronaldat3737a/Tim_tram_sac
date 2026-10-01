@@ -13,6 +13,12 @@ from backend.simulation.vehicle import Vehicle, VehicleState, needs_charging_dec
 
 _ARRIVAL_EPSILON = 1e-9
 
+# Departure cohorts (see Simulator._draw_cohorts).
+_PEAK = "peak"
+_LATE = "late"
+_NON_APP = "non_app"
+_LEGACY = "legacy"
+
 
 class Simulator:
     """Owns the traffic graph, vehicles and stations for one episode run."""
@@ -31,6 +37,7 @@ class Simulator:
     def tick(self) -> None:
         """Advance the simulation by one `config.time_step`."""
         self._move_vehicles()
+        self._dispatch_non_app_vehicles()
         self._update_charging()
         self.simulation_time += self.config.time_step
 
@@ -96,12 +103,32 @@ class Simulator:
             self.stations[vehicle.target_station].incoming_count -= 1
 
     def get_vehicles_needing_decision(self) -> list[Vehicle]:
-        """EVs whose battery is low and have no charging station assigned yet."""
+        """App EVs whose battery is low and have no charging station assigned
+        yet. Non-app EVs are never handed to the agent."""
         return [
             vehicle
             for vehicle in self.vehicles.values()
-            if self.is_active(vehicle) and needs_charging_decision(vehicle, self.config)
+            if not vehicle.is_non_app
+            and self.is_active(vehicle)
+            and needs_charging_decision(vehicle, self.config)
         ]
+
+    def _dispatch_non_app_vehicles(self) -> None:
+        """Send every non-app EV that just ran low to a random station it can
+        reach, through assign_station so it counts as incoming there like any
+        dispatched EV. One that can reach no station fails on the spot."""
+        for vehicle in self.vehicles.values():
+            if not vehicle.is_non_app or not self.is_active(vehicle):
+                continue
+            if not needs_charging_decision(vehicle, self.config):
+                continue
+            reachable = [
+                sid for sid in self.stations if self.is_station_reachable(vehicle.vehicle_id, sid)
+            ]
+            if not reachable:
+                self.fail_vehicle(vehicle)
+                continue
+            self.assign_station(vehicle.vehicle_id, int(self.rng.choice(reachable)))
 
     def is_active(self, vehicle: Vehicle) -> bool:
         """False until the EV's staggered departure tick: it has not joined
@@ -127,6 +154,7 @@ class Simulator:
 
     def _build_vehicles(self) -> dict[int, Vehicle]:
         vehicles = {}
+        cohorts = self._draw_cohorts()
         # Station/depot POI nodes are not real traffic nodes (they only
         # exist to be routed *to*, via their spur edge) -- excluded here so
         # no EV ever spawns at, or is assigned a personal destination at,
@@ -144,13 +172,16 @@ class Simulator:
                 self.rng.uniform(self.config.low_battery_threshold, self.config.battery_capacity)
             )
             speed = float(self.rng.uniform(self.config.min_speed, self.config.max_speed))
+            cohort = cohorts[vehicle_id]
             # Drawn only when staggering is on, so scenarios with every EV
             # departing at tick 0 keep their exact random stream.
-            activation_tick = (
-                int(self.rng.integers(0, self.config.max_activation_tick + 1))
-                if self.config.max_activation_tick > 0
-                else 0
-            )
+            max_tick = self.config.max_activation_tick
+            if cohort == _PEAK or max_tick <= 0:
+                activation_tick = 0
+            elif cohort == _LATE:
+                activation_tick = int(self.rng.integers(1, max_tick + 1))
+            else:
+                activation_tick = int(self.rng.integers(0, max_tick + 1))
             # Defensive: the graph is built as a single connected component,
             # so every node pair has a path in practice. If that ever fails
             # to hold, spawn this EV already at its destination (an
@@ -172,8 +203,23 @@ class Simulator:
                 speed=speed,
                 route=path,
                 activation_tick=activation_tick,
+                is_non_app=cohort == _NON_APP,
             )
         return vehicles
+
+    def _draw_cohorts(self) -> list[str]:
+        """Departure cohort per vehicle_id: exact counts from the configured
+        fractions (peak hour, non-app, late joiners take the rest), shuffled
+        over vehicle ids. Without any cohort config every EV is a plain app
+        EV keeping the old behaviour and random stream: departing at a
+        random tick in [0, max_activation_tick] (tick 0 when that is 0)."""
+        n = self.config.num_vehicles
+        if self.config.peak_hour_fraction <= 0.0 and self.config.non_app_fraction <= 0.0:
+            return [_LEGACY] * n
+        num_peak = round(n * self.config.peak_hour_fraction)
+        num_non_app = min(round(n * self.config.non_app_fraction), n - num_peak)
+        cohorts = [_PEAK] * num_peak + [_NON_APP] * num_non_app + [_LATE] * (n - num_peak - num_non_app)
+        return [cohorts[i] for i in self.rng.permutation(n)]
 
     def _move_vehicles(self) -> None:
         for vehicle in self.vehicles.values():

@@ -75,6 +75,8 @@ class VehicleUpdate(BaseModel):
     eta_seconds: float | None = None
     # Populated only while state == "RETURNING_TO_DEPOT".
     depot_id: int | None = None
+    # A non-app EV (exogenous noise) the agent never dispatches.
+    is_non_app: bool = False
 
 
 class StationUpdate(BaseModel):

@@ -477,3 +477,71 @@ def test_inactive_vehicle_starts_moving_once_active():
     assert vehicle.edge_progress == 0.0 and vehicle.battery_level == 1.0
     simulator.tick()
     assert vehicle.battery_level < 1.0
+
+
+COHORT_CONFIG = replace(
+    SMALL_CONFIG,
+    num_vehicles=10,
+    max_activation_tick=500,
+    peak_hour_fraction=0.6,
+    non_app_fraction=0.2,
+)
+
+
+def test_cohorts_split_peak_late_and_non_app():
+    simulator = Simulator(COHORT_CONFIG, seed=42)
+    vehicles = list(simulator.vehicles.values())
+
+    non_app = [v for v in vehicles if v.is_non_app]
+    app = [v for v in vehicles if not v.is_non_app]
+    peak = [v for v in app if v.activation_tick == 0]
+    late = [v for v in app if v.activation_tick > 0]
+    assert (len(peak), len(late), len(non_app)) == (6, 2, 2)
+    assert all(1 <= v.activation_tick <= COHORT_CONFIG.max_activation_tick for v in late)
+    assert all(0 <= v.activation_tick <= COHORT_CONFIG.max_activation_tick for v in non_app)
+
+    again = Simulator(COHORT_CONFIG, seed=42)
+    assert [(v.is_non_app, v.activation_tick) for v in again.vehicles.values()] == [
+        (v.is_non_app, v.activation_tick) for v in vehicles
+    ]
+
+
+def test_without_cohort_config_no_vehicle_is_non_app():
+    simulator = Simulator(STAGGERED_CONFIG, seed=42)
+
+    assert not any(v.is_non_app for v in simulator.vehicles.values())
+
+
+def test_non_app_vehicle_is_never_offered_to_the_agent():
+    simulator = Simulator(COHORT_CONFIG, seed=42)
+    vehicle = next(v for v in simulator.vehicles.values() if v.is_non_app)
+    vehicle.activation_tick = 0
+    vehicle.battery_level = COHORT_CONFIG.low_battery_threshold
+
+    assert vehicle not in simulator.get_vehicles_needing_decision()
+
+
+def test_non_app_vehicle_is_auto_dispatched_and_counted_as_incoming():
+    simulator = Simulator(COHORT_CONFIG, seed=42)
+    vehicle = next(v for v in simulator.vehicles.values() if v.is_non_app)
+    vehicle.activation_tick = 0
+    vehicle.battery_level = COHORT_CONFIG.low_battery_threshold
+
+    simulator.tick()
+
+    assert vehicle.target_station is not None
+    assert vehicle.state == VehicleState.TRAVELING
+    assert simulator.stations[vehicle.target_station].incoming_count >= 1
+    assert vehicle not in simulator.get_vehicles_needing_decision()
+
+
+def test_non_app_vehicle_that_can_reach_no_station_fails():
+    simulator = Simulator(COHORT_CONFIG, seed=42)
+    vehicle = next(v for v in simulator.vehicles.values() if v.is_non_app)
+    vehicle.activation_tick = 0
+    vehicle.battery_level = 1e-9
+
+    simulator.tick()
+
+    assert vehicle.state == VehicleState.FAILED
+    assert vehicle.target_station is None

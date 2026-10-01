@@ -42,6 +42,10 @@ const VEHICLE_COLORS: Record<VehicleUpdate["state"], string> = {
 // plain gray decorative background traffic dots.
 const EV_HALO_COLOR = "#39ff14";
 const MY_CAR_RING_COLOR = "#facc15"; // gold ring: the one designated "my car"
+// Non-app EVs (exogenous noise the policy never dispatches) swap the neon
+// halo for a static, dashed orange ring with no ping, so they stand apart
+// from AI-dispatched EVs while the body color still encodes vehicle.state.
+const NON_APP_RING_COLOR = "#f97316";
 
 // A station/depot's own POI node (network_graph.py's _add_poi_nodes) is a
 // real graph node with a real (x, y) beside the road -- the frontend reads
@@ -111,16 +115,21 @@ function stateBadgeHtml(state: VehicleUpdate["state"]): string {
 function buildVehicleIcon(
   color: string,
   state: VehicleUpdate["state"],
-  options: { mine?: boolean } = {},
+  options: { mine?: boolean; nonApp?: boolean } = {},
 ): L.DivIcon {
-  const ringColor = options.mine ? MY_CAR_RING_COLOR : EV_HALO_COLOR;
+  const ringColor = options.mine ? MY_CAR_RING_COLOR : options.nonApp ? NON_APP_RING_COLOR : EV_HALO_COLOR;
   const size = options.mine ? 32 : 26;
+  const ping = options.nonApp
+    ? ""
+    : `<span class="animate-ping" style="position:absolute;inset:0;border-radius:9999px;background:${ringColor};opacity:0.55;"></span>`;
+  const borderWidth = options.mine || options.nonApp ? 3 : 2;
+  const borderStyle = options.nonApp ? "dashed" : "solid";
   return L.divIcon({
     className: "ev-marker-icon",
     html: `
       <div style="position:relative;width:${size}px;height:${size}px;">
-        <span class="animate-ping" style="position:absolute;inset:0;border-radius:9999px;background:${ringColor};opacity:0.55;"></span>
-        <div style="position:relative;width:${size}px;height:${size}px;border-radius:9999px;background:${color};border:${options.mine ? 3 : 2}px solid ${ringColor};display:flex;align-items:center;justify-content:center;box-shadow:0 0 8px ${ringColor};">
+        ${ping}
+        <div style="position:relative;width:${size}px;height:${size}px;border-radius:9999px;background:${color};border:${borderWidth}px ${borderStyle} ${ringColor};display:flex;align-items:center;justify-content:center;box-shadow:0 0 8px ${ringColor};">
           ${EV_ICON_HTML}
         </div>
         ${stateBadgeHtml(state)}
@@ -138,6 +147,15 @@ const VEHICLE_ICONS: Record<VehicleUpdate["state"], L.DivIcon> = {
   RETURNING_TO_DEPOT: buildVehicleIcon(VEHICLE_COLORS.RETURNING_TO_DEPOT, "RETURNING_TO_DEPOT"),
   COMPLETED: buildVehicleIcon(VEHICLE_COLORS.COMPLETED, "COMPLETED"),
   FAILED: buildVehicleIcon(VEHICLE_COLORS.FAILED, "FAILED"),
+};
+
+const NON_APP_ICONS: Record<VehicleUpdate["state"], L.DivIcon> = {
+  TRAVELING: buildVehicleIcon(VEHICLE_COLORS.TRAVELING, "TRAVELING", { nonApp: true }),
+  WAITING: buildVehicleIcon(VEHICLE_COLORS.WAITING, "WAITING", { nonApp: true }),
+  CHARGING: buildVehicleIcon(VEHICLE_COLORS.CHARGING, "CHARGING", { nonApp: true }),
+  RETURNING_TO_DEPOT: buildVehicleIcon(VEHICLE_COLORS.RETURNING_TO_DEPOT, "RETURNING_TO_DEPOT", { nonApp: true }),
+  COMPLETED: buildVehicleIcon(VEHICLE_COLORS.COMPLETED, "COMPLETED", { nonApp: true }),
+  FAILED: buildVehicleIcon(VEHICLE_COLORS.FAILED, "FAILED", { nonApp: true }),
 };
 
 const MY_CAR_ICONS: Record<VehicleUpdate["state"], L.DivIcon> = {
@@ -539,7 +557,9 @@ export default function MapComponent({
         .filter((vehicle) => !isHidden(vehicle))
         .map((vehicle) => {
           const isMine = vehicle.id === myVehicleId;
-          const icon = (isMine ? MY_CAR_ICONS : VEHICLE_ICONS)[vehicle.state];
+          const icon = (isMine ? MY_CAR_ICONS : vehicle.is_non_app ? NON_APP_ICONS : VEHICLE_ICONS)[
+            vehicle.state
+          ];
           const opacity = isFading(vehicle) ? 0 : 1;
           return (
             <Marker
@@ -549,7 +569,8 @@ export default function MapComponent({
               opacity={opacity}
             >
               <Tooltip direction="top" offset={[0, -14]}>
-                {isMine ? "★ Xe của tôi — " : ""}EV {vehicle.id} — {vehicle.state} — battery{" "}
+                {isMine ? "★ Xe của tôi — " : ""}EV {vehicle.id}
+                {vehicle.is_non_app ? " (Non-App)" : ""} — {vehicle.state} — battery{" "}
                 {(vehicle.battery * 100).toFixed(0)}%
               </Tooltip>
             </Marker>

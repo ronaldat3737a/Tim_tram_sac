@@ -82,6 +82,16 @@ class SimulationConfig:
     # [0, max_activation_tick]; before that it does not move, drain battery
     # or ask for a decision. 0 = every EV departs at tick 0.
     max_activation_tick: int = 0
+    # Departure cohorts (only drawn when max_activation_tick > 0 or
+    # non_app_fraction > 0). peak_hour_fraction of the EVs depart at tick 0,
+    # non_app_fraction are non-app EVs departing at a random tick in
+    # [0, max_activation_tick], and the rest are late joiners departing at a
+    # random tick in [1, max_activation_tick].
+    peak_hour_fraction: float = 0.0
+    # Non-app EVs are left out of get_vehicles_needing_decision(); once low on
+    # battery the Simulator sends each to a random reachable station, which
+    # still raises that station's incoming_count for the agent to see.
+    non_app_fraction: float = 0.0
 
     # --- Charging station (PROJECT_SPEC.md section 12) ---
     # capacity is the total number of slots at a station, i.e.
@@ -175,6 +185,10 @@ DEFAULT_CONFIG = SimulationConfig()
 #   reaching the 0.75 threshold, so with every EV departing at tick 0 all
 #   decisions landed in the first ~300 ticks. Staggering departures spreads
 #   them over the episode.
+# - peak_hour_fraction 0.6 / non_app_fraction 0.2: a peak-hour burst of 60%
+#   of the EVs departs together at tick 0 so stations are actually contested,
+#   20% join late over the episode, and 20% are non-app EVs grabbing random
+#   stations as exogenous noise the agent has to route around.
 OSM_DEMO_CONFIG = replace(
     DEFAULT_CONFIG,
     charging_rate=1.0 / 900,
@@ -182,4 +196,6 @@ OSM_DEMO_CONFIG = replace(
     low_battery_threshold=0.75,
     max_episode_steps=20_000,
     max_activation_tick=8_000,
+    peak_hour_fraction=0.6,
+    non_app_fraction=0.2,
 )
