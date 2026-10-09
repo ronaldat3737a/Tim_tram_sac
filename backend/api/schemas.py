@@ -8,6 +8,8 @@ from pydantic import BaseModel
 
 Algorithm = Literal["nearest_station", "shortest_time", "least_queue", "dqn", "mappo"]
 SimulationStatus = Literal["stopped", "running", "paused"]
+# A key of backend/config.SCENARIOS, validated by the SimulationManager.
+ScenarioName = str
 
 
 # --- Static network data (sent once via REST, not per tick -- section 34) ---
@@ -31,6 +33,17 @@ class EdgeInfo(BaseModel):
     # curve (section 11) -- what vehicles actually move along and what the
     # frontend renders, always populated (never a straight-line fallback).
     geometry: list[list[float]]
+    # OSM road class (network_graph.HIGHWAY_CLASSES), or "spur" for a
+    # station/depot connector. Display styling only.
+    highway: str | None = None
+
+
+class RoadInfo(BaseModel):
+    """A street of the display-only road layer (vehicles never drive on
+    these unless they are also in `edges`)."""
+
+    highway: str
+    geometry: list[list[float]]
 
 
 class StationInfo(BaseModel):
@@ -52,10 +65,13 @@ class DepotInfo(BaseModel):
 
 
 class NetworkInfo(BaseModel):
+    # The scenario this network belongs to (changes on a scenario switch).
+    scenario: ScenarioName
     nodes: list[NodeInfo]
     edges: list[EdgeInfo]
     stations: list[StationInfo]
     depots: list[DepotInfo]
+    roads: list[RoadInfo] = []
 
 
 # --- Dynamic simulation data (sent every tick via WebSocket -- section 35) ---
@@ -99,6 +115,24 @@ class StartSimulationRequest(BaseModel):
     seed: int | None = None
     algorithm: Algorithm = "nearest_station"
     speed: float = 5.0  # simulated ticks per real second
+    # None keeps the active scenario; otherwise switch to it first.
+    scenario: ScenarioName | None = None
+
+
+class ScenarioRequest(BaseModel):
+    scenario: ScenarioName
+
+
+class ScenarioInfo(BaseModel):
+    name: ScenarioName
+    label: str
+    num_stations: int
+    num_vehicles: int
+    num_depots: int
+    radius_meters: float
+    # Whether this scenario's trained model files exist on disk yet.
+    has_mappo_model: bool
+    has_dqn_model: bool
 
 
 class SpeedRequest(BaseModel):
@@ -107,6 +141,7 @@ class SpeedRequest(BaseModel):
 
 class SimulationStatusResponse(BaseModel):
     status: SimulationStatus
+    scenario: ScenarioName
     simulation_time: float
     episode_seed: int
     algorithm: Algorithm

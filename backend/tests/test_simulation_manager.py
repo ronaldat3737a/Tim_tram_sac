@@ -9,6 +9,7 @@ from stable_baselines3 import DQN
 from backend.api import simulation_manager as simulation_manager_module
 from backend.api.simulation_manager import SimulationManager, _interpolate_position, build_snapshot
 from backend.config import DEFAULT_CONFIG
+from backend.tests.scenario_helpers import single_scenario, two_scenarios
 from backend.simulation.simulator import Simulator
 from backend.simulation.vehicle import VehicleState
 
@@ -18,7 +19,7 @@ TRAINED_MODEL_PATH = Path("models/dqn_osm_model.zip")
 
 @pytest.fixture
 def manager():
-    m = SimulationManager(SMALL_CONFIG)
+    m = SimulationManager(single_scenario(SMALL_CONFIG))
     m.start_background_thread()
     yield m
     m.stop_background_thread()
@@ -71,7 +72,7 @@ def test_dqn_model_loading_does_not_block_status_requests(monkeypatch):
 
     monkeypatch.setattr(simulation_manager_module.DQN, "load", staticmethod(slow_load))
     config = replace(DEFAULT_CONFIG, num_vehicles=5, max_episode_steps=800)
-    manager = SimulationManager(config)
+    manager = SimulationManager(single_scenario(config))
     manager.start_background_thread()
     try:
         start_thread = threading.Thread(
@@ -183,9 +184,7 @@ def test_incompatible_dqn_model_is_rejected_at_load(monkeypatch, tmp_path):
     stale_config = replace(SMALL_CONFIG, num_stations=SMALL_CONFIG.num_stations + 1)
     stale_path = tmp_path / "stale.zip"
     build_model(EVEnv(stale_config), seed=0, net_arch=[8]).save(str(stale_path))
-    monkeypatch.setattr(simulation_manager_module, "DQN_MODEL_PATH", stale_path)
-
-    manager = SimulationManager(SMALL_CONFIG)
+    manager = SimulationManager(single_scenario(SMALL_CONFIG, dqn_model_path=str(stale_path)))
     with pytest.raises(ValueError, match="observation shape"):
         manager._ensure_dqn_model_loaded()
     assert manager._dqn_model is None
@@ -210,8 +209,7 @@ def _mappo_manager(monkeypatch, tmp_path, config=SMALL_CONFIG):
 
     model_path = tmp_path / "mappo.pth"
     build_agent(config, hidden_sizes=(8,)).save(model_path, decision_window=5)
-    monkeypatch.setattr(simulation_manager_module, "MAPPO_MODEL_PATH", model_path)
-    manager = SimulationManager(config)
+    manager = SimulationManager(single_scenario(config, mappo_model_path=str(model_path)))
     manager.request_speed(10_000.0)  # negligible pacing sleep per tick
     manager._ensure_mappo_model_loaded()
     with manager._lock:
@@ -271,9 +269,131 @@ def test_incompatible_mappo_model_is_rejected_at_load(monkeypatch, tmp_path):
     stale_config = replace(SMALL_CONFIG, num_stations=SMALL_CONFIG.num_stations + 1)
     stale_path = tmp_path / "stale.pth"
     build_agent(stale_config, hidden_sizes=(8,)).save(stale_path)
-    monkeypatch.setattr(simulation_manager_module, "MAPPO_MODEL_PATH", stale_path)
-
-    manager = SimulationManager(SMALL_CONFIG)
+    manager = SimulationManager(single_scenario(SMALL_CONFIG, mappo_model_path=str(stale_path)))
     with pytest.raises(ValueError, match="obs_dim"):
         manager._ensure_mappo_model_loaded()
     assert manager._mappo_model is None
+
+
+def test_parked_vehicles_are_reported_exactly_at_their_station_every_tick():
+    # Regression guard for the map: a WAITING/CHARGING vehicle's snapshot
+    # position must be its station's own node coordinate, and it must really
+    # be in that station's queue or chargers.
+    from backend.ai_core.ev_env import EVEnv
+    from backend.baseline import nearest_station
+
+    seen = {"WAITING": 0, "CHARGING": 0}
+
+    def audit(simulator):
+        for v in build_snapshot(simulator, SMALL_CONFIG, 0.2)["vehicles"]:
+            if v["state"] not in seen:
+                continue
+            seen[v["state"]] += 1
+            station = simulator.stations[v["station_id"]]
+            node = simulator.graph.nodes[station.node_id]
+            assert (v["x"], v["y"]) == (node["x"], node["y"])
+            assert v["node"] == station.node_id
+            assert v["id"] in station.queue or v["id"] in station.charging_vehicle_ids
+
+    # Few stations with a single charger each, so EVs also queue (WAITING).
+    config = replace(
+        SMALL_CONFIG, num_stations=2, num_chargers_per_station=1, num_vehicles=15, max_episode_steps=3000
+    )
+    env = EVEnv(config, tick_hook=audit)
+    _, info = env.reset(seed=3)
+    done = False
+    while not done:
+        station_id = nearest_station.choose_station(env.simulator, info["next_vehicle_id"])
+        _, _, terminated, truncated, info = env.step(env._station_ids.index(station_id))
+        done = terminated or truncated
+
+    assert seen["WAITING"] > 0 and seen["CHARGING"] > 0
+
+
+def test_network_info_reports_road_classes_and_the_display_road_layer(manager):
+    info = manager.get_network_info()
+
+    assert all(edge["highway"] for edge in info["edges"])
+    assert info["roads"], "display road layer should not be empty"
+    assert all(len(road["geometry"]) >= 2 for road in info["roads"])
+
+
+def test_network_info_survives_a_road_layer_that_cannot_be_built(monkeypatch):
+    from backend.simulation import network_graph
+
+    def unavailable(config):
+        raise OSError("no cache and no network")
+
+    monkeypatch.setattr(network_graph, "_load_or_fetch_road_layer_graph", unavailable)
+    manager = SimulationManager(single_scenario(SMALL_CONFIG))
+    with manager._lock:
+        manager._reset_episode_locked(seed=1, algorithm="nearest_station")
+
+    info = manager.get_network_info()
+
+    assert info["roads"] == [] and info["edges"]
+
+
+LARGER_CONFIG = replace(SMALL_CONFIG, num_stations=8, num_vehicles=10)
+
+
+def test_scenario_switch_rebuilds_the_episode_on_the_new_config(tmp_path):
+    manager = SimulationManager(
+        two_scenarios(SMALL_CONFIG, LARGER_CONFIG, mappo_model_path=str(tmp_path / "missing.pth"))
+    )
+    with manager._lock:
+        manager._reset_episode_locked(seed=1, algorithm="nearest_station")
+    assert manager.get_status()["scenario"] == "small"
+
+    manager.request_scenario("large")
+
+    assert manager.scenario.name == "large"
+    assert manager.config is LARGER_CONFIG
+    assert manager.get_status()["scenario"] == "large"
+    assert manager.get_status()["status"] == "paused"
+    info = manager.get_network_info()
+    assert info["scenario"] == "large"
+    assert len(info["stations"]) == LARGER_CONFIG.num_stations
+    assert len(manager.env.simulator.vehicles) == LARGER_CONFIG.num_vehicles
+
+    manager.request_scenario("small")
+    assert len(manager.get_network_info()["stations"]) == SMALL_CONFIG.num_stations
+
+
+def test_scenario_switch_without_that_scenarios_mappo_model_falls_back_to_a_baseline(tmp_path):
+    from backend.ai_core.train_mappo import build_agent
+
+    small_model = tmp_path / "small.pth"
+    build_agent(SMALL_CONFIG, hidden_sizes=(8,)).save(small_model, decision_window=5)
+    scenarios = two_scenarios(SMALL_CONFIG, LARGER_CONFIG, mappo_model_path=str(tmp_path / "missing.pth"))
+    scenarios["small"] = replace(scenarios["small"], mappo_model_path=str(small_model))
+    manager = SimulationManager(scenarios)
+    manager.request_speed(10_000.0)
+    manager.request_start(seed=3, algorithm="mappo", speed=10_000.0)
+    manager.request_pause()
+
+    manager.request_scenario("large")
+
+    assert manager.algorithm == simulation_manager_module.DQN_FALLBACK_ALGORITHM
+    with pytest.raises(FileNotFoundError, match="--scenario large"):
+        manager.request_start(seed=3, algorithm="mappo", speed=10_000.0)
+    # The rejected start left the large scenario's episode in place.
+    assert manager.scenario.name == "large"
+    # Each scenario keeps its own loaded model.
+    manager.request_start(seed=3, algorithm="mappo", speed=10_000.0, scenario="small")
+    assert manager.scenario.name == "small" and manager.algorithm == "mappo"
+    manager.request_pause()
+
+
+def test_unknown_scenario_is_rejected_without_changing_anything():
+    manager = SimulationManager(single_scenario(SMALL_CONFIG))
+    with manager._lock:
+        manager._reset_episode_locked(seed=1, algorithm="nearest_station")
+    env = manager.env
+
+    with pytest.raises(ValueError, match="unknown scenario"):
+        manager.request_scenario("large")
+    with pytest.raises(ValueError, match="unknown scenario"):
+        manager.request_start(seed=1, algorithm="nearest_station", speed=5.0, scenario="large")
+
+    assert manager.env is env and manager.scenario.name == "small"

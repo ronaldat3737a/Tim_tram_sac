@@ -194,3 +194,41 @@ def test_train_saves_a_loadable_best_model(tmp_path):
     assert (loaded.obs_dim, loaded.state_dim, loaded.num_actions) == (OBS_DIM, STATE_DIM, NUM_ACTIONS)
     assert loaded.metadata["decision_window"] == 15
     assert "validation_reward_per_decision" in loaded.metadata
+
+
+def test_sequential_decisions_flag_round_trips_and_old_checkpoints_default_to_all_at_once(agent, tmp_path):
+    sequential = MAPPOAgent(OBS_DIM, STATE_DIM, NUM_ACTIONS, hidden_sizes=(16,), sequential_decisions=True)
+    sequential.save(tmp_path / "seq.pth")
+    assert MAPPOAgent.load(tmp_path / "seq.pth").sequential_decisions is True
+
+    checkpoint = torch.load(tmp_path / "seq.pth", weights_only=True)
+    del checkpoint["sequential_decisions"]  # as saved before the flag existed
+    torch.save(checkpoint, tmp_path / "old.pth")
+    assert MAPPOAgent.load(tmp_path / "old.pth").sequential_decisions is False
+
+
+@pytest.mark.parametrize("sequential", [False, True])
+def test_act_returns_one_aligned_row_per_agent(sequential):
+    torch.manual_seed(0)
+    agent = build_agent(MARL_CONFIG, hidden_sizes=(16,), sequential_decisions=sequential)
+    env = MultiAgentEVEnv(MARL_CONFIG, decision_window=200)
+    obs, _ = env.reset(seed=3)
+
+    agents, obs_batch, actions, log_probs = agent.act(env, obs, deterministic=False)
+
+    assert agents == env.agents
+    assert obs_batch.shape == (len(agents), OBS_DIM)
+    assert actions.shape == log_probs.shape == (len(agents),)
+    # The log-probs are those of the actions under the observations returned.
+    recomputed, _, _ = agent.evaluate_actions(
+        torch.as_tensor(obs_batch), torch.zeros(len(agents), STATE_DIM), torch.as_tensor(actions)
+    )
+    assert np.allclose(recomputed.detach().numpy(), log_probs, atol=1e-5)
+    # The first agent always sees the untouched batch observation.
+    assert np.allclose(obs_batch[0], obs[agents[0]])
+
+
+def test_sequential_training_episode_runs_end_to_end():
+    agent = build_agent(MARL_CONFIG, hidden_sizes=(16,), sequential_decisions=True)
+    episode = run_episode(MultiAgentEVEnv(MARL_CONFIG), agent, seed=3, deterministic=False)
+    assert episode.batches and episode.stats.num_decisions > 0

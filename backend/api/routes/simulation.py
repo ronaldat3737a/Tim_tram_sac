@@ -7,6 +7,8 @@ from fastapi import APIRouter, HTTPException, Request
 from backend.api.schemas import (
     MyCarPreviewResponse,
     NetworkInfo,
+    ScenarioInfo,
+    ScenarioRequest,
     SimulationStatusResponse,
     SpeedRequest,
     StartSimulationRequest,
@@ -25,6 +27,23 @@ def get_network(request: Request) -> NetworkInfo:
     return NetworkInfo(**_manager(request).get_network_info())
 
 
+@router.get("/scenarios", response_model=list[ScenarioInfo])
+def list_scenarios(request: Request) -> list[ScenarioInfo]:
+    return [ScenarioInfo(**info) for info in _manager(request).list_scenarios()]
+
+
+@router.post("/simulation/scenario", response_model=SimulationStatusResponse)
+def switch_scenario(payload: ScenarioRequest, request: Request) -> SimulationStatusResponse:
+    """Switch the map/config/models to another scenario: a fresh, paused
+    episode. Clients then re-fetch /api/network."""
+    manager = _manager(request)
+    try:
+        manager.request_scenario(payload.scenario)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return SimulationStatusResponse(**manager.get_status())
+
+
 @router.get("/simulation/status", response_model=SimulationStatusResponse)
 def get_status(request: Request) -> SimulationStatusResponse:
     return SimulationStatusResponse(**_manager(request).get_status())
@@ -34,7 +53,9 @@ def get_status(request: Request) -> SimulationStatusResponse:
 def start_simulation(payload: StartSimulationRequest, request: Request) -> SimulationStatusResponse:
     manager = _manager(request)
     try:
-        manager.request_start(seed=payload.seed, algorithm=payload.algorithm, speed=payload.speed)
+        manager.request_start(
+            seed=payload.seed, algorithm=payload.algorithm, speed=payload.speed, scenario=payload.scenario
+        )
     except (ValueError, FileNotFoundError, RuntimeError) as exc:
         # RuntimeError covers EVEnv.reset() refusing a degenerate
         # scenario/seed where no EV in it ever needs a charging decision

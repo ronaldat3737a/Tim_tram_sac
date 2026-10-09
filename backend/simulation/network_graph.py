@@ -15,6 +15,11 @@ renders beside the road, never on it. Because the spur is an ordinary graph
 edge like any other, the existing routing/movement/geometry-interpolation
 code handles an EV crawling into and back out of a station/depot with no
 special-casing at all -- shortest_path simply routes through it.
+
+Separately, build_road_layer() returns every drivable street of the extract
+(including the small `service` alleys the routing graph's default "drive"
+filter leaves out) purely for display. It never feeds routing or the simulation,
+so the trained policies keep facing exactly the graph they were trained on.
 """
 
 from __future__ import annotations
@@ -29,6 +34,29 @@ from shapely.geometry import LineString, Point
 from backend.config import SimulationConfig
 
 VALID_ROUTING_WEIGHTS = ("distance", "travel_time")
+
+# OSM highway classes, most important first. An OSM way merged from several
+# classes (osmnx then stores a list) is shown as its most important one.
+HIGHWAY_CLASSES = (
+    "motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link",
+    "secondary", "secondary_link", "tertiary", "tertiary_link", "unclassified",
+    "residential", "living_street", "road", "service",
+)
+DEFAULT_HIGHWAY_CLASS = "unclassified"
+# highway value of a station/depot spur edge (not an OSM road).
+SPUR_HIGHWAY_CLASS = "spur"
+
+# Overpass filter for every way a car can drive on, i.e. osmnx's "drive"
+# filter without excluding `service` roads (most of the small alleys around
+# Nghia Do are tagged service), still leaving out footways/pedestrian/steps,
+# parking aisles and private/emergency access. Used by the display road
+# layer, and by the routing graph when config.osm_full_drive_network is set.
+FULL_DRIVE_FILTER = (
+    '["highway"]["area"!~"yes"]["access"!~"private"]'
+    '["highway"!~"abandoned|bridleway|bus_guideway|construction|corridor|cycleway|elevator|'
+    'escalator|footway|no|path|pedestrian|planned|platform|proposed|raceway|razed|steps|track"]'
+    '["service"!~"parking_aisle|private|emergency_access"]'
+)
 
 # Local flat-earth approximation for converting between degrees and meters,
 # accurate enough at the scale of this simulation (a ~1km-radius extract,
@@ -99,6 +127,45 @@ def build_network(config: SimulationConfig, seed: int | None = None) -> nx.Graph
     return graph
 
 
+def build_road_layer(config: SimulationConfig) -> list[dict]:
+    """Every drivable street in the extract, for display only: one entry per
+    street segment (both travel directions collapse into one), as
+    {"highway": class, "geometry": [[lat, lng], ...]}. Fetched once via
+    osmnx and cached to config.osm_road_layer_cache_path, like the routing
+    graph."""
+    raw_graph = _load_or_fetch_road_layer_graph(config)
+    roads, seen = [], set()
+    for u, v, key, data in raw_graph.edges(keys=True, data=True):
+        segment = (min(u, v), max(u, v), key)
+        if u == v or segment in seen:
+            continue
+        seen.add(segment)
+        line = data.get("geometry")
+        if line is None:
+            node_u, node_v = raw_graph.nodes[u], raw_graph.nodes[v]
+            line = LineString([(node_u["x"], node_u["y"]), (node_v["x"], node_v["y"])])
+        roads.append(
+            {
+                "highway": highway_class(data.get("highway")),
+                "geometry": [[float(y), float(x)] for x, y in line.coords],
+            }
+        )
+    return roads
+
+
+def highway_class(value) -> str:
+    """Normalize an OSM `highway` tag (a string, a list, or a list saved to
+    GraphML as its string repr) to the single most important known class."""
+    if value is None:
+        return DEFAULT_HIGHWAY_CLASS
+    if isinstance(value, str):
+        value = [part.strip(" '\"") for part in value.strip("[]").split(",")]
+    known = [v for v in value if v in HIGHWAY_CLASSES]
+    if not known:
+        return DEFAULT_HIGHWAY_CLASS
+    return min(known, key=HIGHWAY_CLASSES.index)
+
+
 def shortest_path(
     graph: nx.Graph, source: int, target: int, weight: str | None = None
 ) -> tuple[list[int], float, float]:
@@ -107,7 +174,15 @@ def shortest_path(
     if weight_key not in VALID_ROUTING_WEIGHTS:
         raise ValueError(f"weight must be one of {VALID_ROUTING_WEIGHTS}")
 
-    path = nx.shortest_path(graph, source, target, weight=weight_key)
+    predecessors = _poi_shortest_path_tree(graph, target, weight_key)
+    if predecessors is not None:
+        if source not in predecessors:
+            raise nx.NetworkXNoPath(f"node {source} is not reachable from {target}")
+        path = [source]
+        while path[-1] != target:
+            path.append(predecessors[path[-1]][0])
+    else:
+        path = nx.shortest_path(graph, source, target, weight=weight_key)
     total_distance = sum(
         graph.edges[u, v]["distance"] for u, v in zip(path, path[1:])
     )
@@ -115,6 +190,23 @@ def shortest_path(
         graph.edges[u, v]["travel_time"] for u, v in zip(path, path[1:])
     )
     return path, total_distance, total_travel_time
+
+
+def _poi_shortest_path_tree(graph: nx.Graph, root: int, weight: str) -> dict | None:
+    """Shortest-path tree (Dijkstra predecessors) rooted at a station/depot
+    POI node, or None for any other target. Nearly every route ends at a
+    station or depot, so one tree per POI, built on first use and cached on
+    the graph, replaces thousands of point-to-point searches per episode
+    (on the large map each one costs milliseconds). The graph is undirected
+    and never changes after build_network, so a node's path to the root is
+    its tree branch, and the cache stays valid for the graph's lifetime."""
+    if root not in graph.graph.get("station_nodes", ()) and root not in graph.graph.get("depot_nodes", ()):
+        return None
+    trees = graph.graph.setdefault("_shortest_path_trees", {})
+    key = (root, weight)
+    if key not in trees:
+        trees[key] = nx.dijkstra_predecessor_and_distance(graph, root, weight=weight)[0]
+    return trees[key]
 
 
 def get_station_nodes(graph: nx.Graph) -> list[int]:
@@ -241,6 +333,7 @@ def _add_poi_nodes(
             distance=distance,
             geometry=LineString([access_xy, poi_xy]),
             geometry_start=access_node,
+            highway=SPUR_HIGHWAY_CLASS,
             speed=config.poi_approach_speed_mps,
             traffic_weight=0.0,
             travel_time=travel_time,
@@ -256,17 +349,49 @@ def _load_or_fetch_osm_graph(config: SimulationConfig):
     requiring network access."""
     import osmnx as ox
 
-    cache_path = Path(config.osm_cache_path)
-    if cache_path.exists():
-        return ox.load_graphml(cache_path)
-
-    raw_graph = ox.graph_from_point(
-        (config.osm_center_lat, config.osm_center_lng),
-        dist=config.osm_radius_meters,
-        network_type="drive",
+    if config.osm_full_drive_network:
+        # Same query as the road layer, so both may share one cache file.
+        return _load_or_fetch_full_drive_graph(config.osm_cache_path, config)
+    return _load_or_fetch(
+        config.osm_cache_path,
+        lambda: ox.graph_from_point(
+            (config.osm_center_lat, config.osm_center_lng),
+            dist=config.osm_radius_meters,
+            network_type="drive",
+        ),
     )
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    ox.save_graphml(raw_graph, cache_path)
+
+
+def _load_or_fetch_road_layer_graph(config: SimulationConfig):
+    """Same caching as _load_or_fetch_osm_graph, for the display road layer
+    (FULL_DRIVE_FILTER, every connected piece kept). Kept as its own
+    function so tests can monkeypatch it."""
+    return _load_or_fetch_full_drive_graph(config.osm_road_layer_cache_path, config)
+
+
+def _load_or_fetch_full_drive_graph(cache_path: str, config: SimulationConfig):
+    import osmnx as ox
+
+    return _load_or_fetch(
+        cache_path,
+        lambda: ox.graph_from_point(
+            (config.osm_center_lat, config.osm_center_lng),
+            dist=config.osm_radius_meters,
+            custom_filter=FULL_DRIVE_FILTER,
+            retain_all=True,
+        ),
+    )
+
+
+def _load_or_fetch(cache_path: str, fetch):
+    import osmnx as ox
+
+    path = Path(cache_path)
+    if path.exists():
+        return ox.load_graphml(path)
+    raw_graph = fetch()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ox.save_graphml(raw_graph, path)
     return raw_graph
 
 
@@ -305,7 +430,11 @@ def _convert_osm_graph(raw_graph) -> nx.Graph:
             node_u, node_v = raw_graph.nodes[u], raw_graph.nodes[v]
             line = LineString([(node_u["x"], node_u["y"]), (node_v["x"], node_v["y"])])
 
-        graph.add_edge(u, v, distance=length, geometry=line, geometry_start=u)
+        # highway is display-only (road styling); nothing reads it for
+        # routing or physics.
+        graph.add_edge(
+            u, v, distance=length, geometry=line, geometry_start=u, highway=highway_class(data.get("highway"))
+        )
 
     if graph.number_of_nodes() == 0 or graph.number_of_edges() == 0:
         raise ValueError("OSM graph has no usable nodes/edges after conversion")

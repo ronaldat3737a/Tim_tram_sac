@@ -11,6 +11,21 @@ export type Algorithm =
 
 export type SimulationStatus = "stopped" | "running" | "paused";
 
+// A key of backend/config.SCENARIOS ("small", "large").
+export type ScenarioName = string;
+
+export interface ScenarioInfo {
+  name: ScenarioName;
+  label: string;
+  num_stations: number;
+  num_vehicles: number;
+  num_depots: number;
+  radius_meters: number;
+  // Whether this scenario's trained model files exist on the backend yet.
+  has_mappo_model: boolean;
+  has_dqn_model: boolean;
+}
+
 export type VehicleState =
   | "TRAVELING"
   | "WAITING"
@@ -38,6 +53,9 @@ export interface EdgeInfo {
   // Detailed [lat, lng] polyline following this edge's real street curve --
   // what vehicles actually move along and what the map renders.
   geometry: [number, number][];
+  // OSM road class (e.g. "primary", "residential"), or "spur" for a
+  // station/depot connector. Styling only.
+  highway: string | null;
 }
 
 export interface StationInfo {
@@ -58,11 +76,22 @@ export interface DepotInfo {
   access_node_id: number;
 }
 
+// A street of the display-only road layer: every drivable OSM way in the
+// extract, including alleys vehicles never route over unless the same street
+// is also one of `edges`.
+export interface RoadInfo {
+  highway: string;
+  geometry: [number, number][];
+}
+
 export interface NetworkInfo {
+  // The scenario this network belongs to (changes on a scenario switch).
+  scenario: ScenarioName;
   nodes: NodeInfo[];
   edges: EdgeInfo[];
   stations: StationInfo[];
   depots: DepotInfo[];
+  roads: RoadInfo[];
 }
 
 // --- Dynamic simulation data (WebSocket, every tick) ---
@@ -105,10 +134,13 @@ export interface StartSimulationRequest {
   seed?: number;
   algorithm: Algorithm;
   speed: number;
+  // Omitted: keep the active scenario.
+  scenario?: ScenarioName;
 }
 
 export interface SimulationStatusResponse {
   status: SimulationStatus;
+  scenario: ScenarioName;
   simulation_time: number;
   episode_seed: number;
   algorithm: Algorithm;

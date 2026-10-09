@@ -2,10 +2,12 @@
 // Thin fetch wrappers only -- no simulation/reward logic here (section 39).
 
 import type {
-  Algorithm,
   MyCarPreviewResponse,
   NetworkInfo,
+  ScenarioInfo,
+  ScenarioName,
   SimulationStatusResponse,
+  StartSimulationRequest,
 } from "@/lib/types";
 
 export const API_BASE_URL =
@@ -27,15 +29,23 @@ export function fetchNetworkInfo(): Promise<NetworkInfo> {
   return request<NetworkInfo>("/api/network");
 }
 
+export function fetchScenarios(): Promise<ScenarioInfo[]> {
+  return request<ScenarioInfo[]>("/api/scenarios");
+}
+
+// Fresh, paused episode on another scenario's map; re-fetch the network after.
+export function switchScenario(scenario: ScenarioName): Promise<SimulationStatusResponse> {
+  return request<SimulationStatusResponse>("/api/simulation/scenario", {
+    method: "POST",
+    body: JSON.stringify({ scenario }),
+  });
+}
+
 export function fetchStatus(): Promise<SimulationStatusResponse> {
   return request<SimulationStatusResponse>("/api/simulation/status");
 }
 
-export function startSimulation(params: {
-  seed?: number;
-  algorithm: Algorithm;
-  speed: number;
-}): Promise<SimulationStatusResponse> {
+export function startSimulation(params: StartSimulationRequest): Promise<SimulationStatusResponse> {
   return request<SimulationStatusResponse>("/api/simulation/start", {
     method: "POST",
     body: JSON.stringify(params),

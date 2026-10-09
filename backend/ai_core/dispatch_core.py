@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import networkx as nx
 import numpy as np
 
 from backend.config import SimulationConfig
@@ -236,17 +237,28 @@ class DispatchContext:
         return _sanitize(features)
 
     def _compute_normalization_constants(self) -> tuple[float, float]:
+        """Largest (distance, travel_time) of any node's shortest route to
+        any station. One Dijkstra tree per station (the graph is undirected,
+        so station -> node routes equal node -> station ones) instead of one
+        search per (node, station) pair, which the large map's ~7.6k nodes
+        make far too slow."""
         graph = self.simulator.graph
-        station_nodes = get_station_nodes(graph)
+        weight = self.config.routing_weight
+        other = "distance" if weight == "travel_time" else "travel_time"
         max_distance = 0.0
         max_travel_time = 0.0
-        for node in graph.nodes():
-            for station_node in station_nodes:
-                _, distance, travel_time = shortest_path(
-                    graph, node, station_node, weight=self.config.routing_weight
-                )
-                max_distance = max(max_distance, distance)
-                max_travel_time = max(max_travel_time, travel_time)
+        for station_node in get_station_nodes(graph):
+            predecessors, weight_totals = nx.dijkstra_predecessor_and_distance(graph, station_node, weight=weight)
+            # weight_totals is in settle order, so a node's predecessor on
+            # the tree always has its total already.
+            other_totals = {station_node: 0.0}
+            for node in weight_totals:
+                if node != station_node:
+                    parent = predecessors[node][0]
+                    other_totals[node] = other_totals[parent] + graph.edges[parent, node][other]
+            totals = {weight: max(weight_totals.values()), other: max(other_totals.values())}
+            max_distance = max(max_distance, totals["distance"])
+            max_travel_time = max(max_travel_time, totals["travel_time"])
         return max(max_distance, 1e-6), max(max_travel_time, 1e-6)
 
     def _normalize_xy(self, x: float, y: float) -> tuple[float, float]:

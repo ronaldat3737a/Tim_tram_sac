@@ -5,23 +5,27 @@ import L, { type LatLngTuple } from "leaflet";
 import { Car, ParkingSquare, Zap } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { CircleMarker, MapContainer, Marker, Polyline, TileLayer, Tooltip } from "react-leaflet";
+import { CircleMarker, MapContainer, Marker, Polyline, TileLayer, Tooltip, useMap } from "react-leaflet";
 import type { MyCarPreviewResponse, NetworkInfo, StationUpdate, VehicleUpdate } from "@/lib/types";
 
-// Fallback center used only until the real network graph loads; once it
-// does, the map re-centers on the actual node average (section 11: the
-// graph is always a real OpenStreetMap street network).
+// Initial view only: FitToNetwork fits the camera to the real network's
+// bounds as soon as it is shown, and again on every scenario switch
+// (section 11: the graph is always a real OpenStreetMap street network).
 const FALLBACK_CENTER: LatLngTuple = [21.0385, 105.7973];
 const DEFAULT_ZOOM = 15;
+const FIT_PADDING_PX: [number, number] = [16, 16];
 
 // Free, no-API-key tile source (section 7: "Không yêu cầu API trả phí").
 // CartoDB's basemaps.cartocdn.com now requires a registered API key even
 // for the free "light_all" style (confirmed by an "API KEY REQUIRED"
-// watermark when tried), so this uses the standard OpenStreetMap tile
-// server instead, which stays key-free.
-const TILE_URL = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png";
+// watermark when tried, also for "rastertiles/voyager"). The standard
+// tile.openstreetmap.org server is unreachable from some networks (their
+// DNS answers 127.0.0.1 for it), which left the map with no basemap at all,
+// so the default is OpenStreetMap France's key-free rendering of the same
+// OSM data. NEXT_PUBLIC_TILE_URL overrides it.
+const TILE_URL = process.env.NEXT_PUBLIC_TILE_URL ?? "https://{s}.tile.openstreetmap.fr/osmfr/{z}/{x}/{y}.png";
 const TILE_ATTRIBUTION =
-  '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
+  '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, tiles by OpenStreetMap France';
 
 // TRAVELING stays the plain default green; WAITING/CHARGING/
 // RETURNING_TO_DEPOT each get a distinct color *and* a small badge (see
@@ -47,22 +51,70 @@ const MY_CAR_RING_COLOR = "#facc15"; // gold ring: the one designated "my car"
 // from AI-dispatched EVs while the body color still encodes vehicle.state.
 const NON_APP_RING_COLOR = "#f97316";
 
-// A station/depot's own POI node (network_graph.py's _add_poi_nodes) is a
-// real graph node with a real (x, y) beside the road -- the frontend reads
-// it straight from NetworkInfo.nodes, the same way as any other node
-// (section 39: never invents a position itself). Once an EV has actually
-// arrived (WAITING/CHARGING/COMPLETED), vehicle.x/y IS that exact POI
-// position too, so multiple vehicles at the same station/depot would
-// otherwise render as one overlapping icon -- this small additional
-// per-vehicle spread is the one thing that stays a purely cosmetic,
-// frontend-only, deterministic (golden-angle) computation.
-const CHARGING_CLUSTER_RADIUS_DEGREES = 0.00006;
-const QUEUE_CLUSTER_RADIUS_DEGREES = 0.00015;
-const PARKED_CLUSTER_RADIUS_DEGREES = 0.00012;
+// Once an EV has arrived (WAITING/CHARGING at a station, COMPLETED at a
+// depot or its destination), vehicle.x/y IS that exact node position, so
+// every car there shares one coordinate with the station/depot icon. The
+// marker stays at that exact coordinate; only its icon is shifted, in
+// screen pixels, onto a ring around the node: chargers on the inner ring,
+// the queue on outer rings. A pixel layout stays clear of the 26px
+// station icon and of the other cars at every zoom level, which a fixed
+// geographic offset cannot (a few meters is ~1-4px at zoom 15).
+const PARKED_ICON_SIZE = 20;
+const MY_PARKED_ICON_SIZE = 26;
+const INNER_RING_RADIUS_PX = 26;
+const QUEUE_RING_RADIUS_PX = 46;
+const QUEUE_RING_SPACING_PX = 20;
+const QUEUE_RING_CAPACITY = 10;
+// Leaflet stacks markers by screen y, not by JSX order, so a car just north
+// of its station would sit under the station icon. Vehicles always win.
+const VEHICLE_Z_INDEX_OFFSET = 10_000;
+const MY_CAR_Z_INDEX_OFFSET = 20_000;
+// Above this many EVs on the map, every EV but "my car" uses the lite icon.
+const LITE_ICON_VEHICLE_THRESHOLD = 100;
 
-function goldenAngleOffset(id: number, radiusDegrees: number): [number, number] {
-  const angleRad = ((id * 137.508) % 360) * (Math.PI / 180);
-  return [Math.cos(angleRad) * radiusDegrees, Math.sin(angleRad) * radiusDegrees];
+type PixelOffset = [number, number];
+
+function ringOffset(index: number, count: number, radius: number): PixelOffset {
+  const angle = -Math.PI / 2 + (2 * Math.PI * index) / Math.max(count, 1);
+  return [Math.round(Math.cos(angle) * radius), Math.round(Math.sin(angle) * radius)];
+}
+
+// Queue slots fill consecutive outer rings of QUEUE_RING_CAPACITY cars.
+function queueOffset(index: number, count: number): PixelOffset {
+  const ring = Math.floor(index / QUEUE_RING_CAPACITY);
+  const onThisRing = Math.min(count - ring * QUEUE_RING_CAPACITY, QUEUE_RING_CAPACITY);
+  return ringOffset(index % QUEUE_RING_CAPACITY, onThisRing, QUEUE_RING_RADIUS_PX + ring * QUEUE_RING_SPACING_PX);
+}
+
+// Icon offset for every vehicle parked at a station/depot/destination node,
+// keyed by vehicle id. Slots are assigned in vehicle-id order within each
+// group, so a car keeps its slot while the group is unchanged.
+function parkedOffsets(vehicles: VehicleUpdate[]): Map<number, PixelOffset> {
+  const groups = new Map<string, { charging: number[]; waiting: number[]; parked: number[] }>();
+  const group = (key: string) => {
+    let entry = groups.get(key);
+    if (!entry) {
+      entry = { charging: [], waiting: [], parked: [] };
+      groups.set(key, entry);
+    }
+    return entry;
+  };
+  for (const vehicle of vehicles) {
+    if ((vehicle.state === "CHARGING" || vehicle.state === "WAITING") && vehicle.station_id !== null) {
+      const entry = group(`station-${vehicle.station_id}`);
+      (vehicle.state === "CHARGING" ? entry.charging : entry.waiting).push(vehicle.id);
+    } else if (vehicle.state === "COMPLETED") {
+      group(`node-${vehicle.node}`).parked.push(vehicle.id);
+    }
+  }
+  const offsets = new Map<number, PixelOffset>();
+  for (const { charging, waiting, parked } of groups.values()) {
+    for (const ids of [charging, waiting, parked]) ids.sort((a, b) => a - b);
+    charging.forEach((id, i) => offsets.set(id, ringOffset(i, charging.length, INNER_RING_RADIUS_PX)));
+    waiting.forEach((id, i) => offsets.set(id, queueOffset(i, waiting.length)));
+    parked.forEach((id, i) => offsets.set(id, ringOffset(i, parked.length, INNER_RING_RADIUS_PX)));
+  }
+  return offsets;
 }
 
 // Backend node/vehicle (x, y) are always real (lng, lat) -- section 11: the
@@ -79,6 +131,7 @@ function edgeKey(source: number, target: number): string {
 // --- Icons -------------------------------------------------------------
 
 const EV_ICON_HTML = renderToStaticMarkup(<Car color="#052e16" strokeWidth={2.5} size={15} />);
+const EV_ICON_SMALL_HTML = renderToStaticMarkup(<Car color="#052e16" strokeWidth={2.5} size={11} />);
 const STATION_ICON_HTML = renderToStaticMarkup(
   <Zap color="#ffffff" fill="#ffffff" strokeWidth={2} size={14} />,
 );
@@ -95,13 +148,13 @@ const BADGE_PARKING_HTML = renderToStaticMarkup(
 // RETURNING_TO_DEPOT (parking icon) never read as a frozen/disconnected
 // vehicle -- TRAVELING/COMPLETED/FAILED get no badge, only the states that
 // could otherwise look "stuck".
-function stateBadgeHtml(state: VehicleUpdate["state"]): string {
+function stateBadgeHtml(state: VehicleUpdate["state"], lite = false): string {
   const badgeBase =
     "position:absolute;top:-4px;right:-4px;width:14px;height:14px;border-radius:9999px;" +
     "display:flex;align-items:center;justify-content:center;border:1.5px solid #ffffff;" +
     "color:#ffffff;font-size:9px;font-weight:700;line-height:1;";
   if (state === "WAITING") {
-    return `<span class="animate-pulse" style="${badgeBase}background:#d97706;">W</span>`;
+    return `<span class="${lite ? "" : "animate-pulse"}" style="${badgeBase}background:#d97706;">W</span>`;
   }
   if (state === "CHARGING") {
     return `<span style="${badgeBase}background:#1d4ed8;">${BADGE_ZAP_HTML}</span>`;
@@ -112,60 +165,65 @@ function stateBadgeHtml(state: VehicleUpdate["state"]): string {
   return "";
 }
 
+interface VehicleIconOptions {
+  mine?: boolean;
+  nonApp?: boolean;
+  // Set for a car parked at a node: smaller icon shifted by this many pixels.
+  offset?: PixelOffset;
+  // Many EVs on screen (the large scenario): no ping animation, glow or
+  // pulsing badge -- hundreds of continuously animated, shadowed DOM
+  // elements are what make the browser stutter. Body color, ring and badge
+  // still encode the same state.
+  lite?: boolean;
+}
+
 function buildVehicleIcon(
   color: string,
   state: VehicleUpdate["state"],
-  options: { mine?: boolean; nonApp?: boolean } = {},
+  options: VehicleIconOptions = {},
 ): L.DivIcon {
   const ringColor = options.mine ? MY_CAR_RING_COLOR : options.nonApp ? NON_APP_RING_COLOR : EV_HALO_COLOR;
-  const size = options.mine ? 32 : 26;
-  const ping = options.nonApp
+  const parked = options.offset !== undefined;
+  const size = parked ? (options.mine ? MY_PARKED_ICON_SIZE : PARKED_ICON_SIZE) : options.mine ? 32 : 26;
+  const [dx, dy] = options.offset ?? [0, 0];
+  // The ping halo means "on the road, being dispatched"; a parked car has
+  // none (it would also pulse over its neighbors on the ring).
+  const ping = options.nonApp || parked || options.lite
     ? ""
     : `<span class="animate-ping" style="position:absolute;inset:0;border-radius:9999px;background:${ringColor};opacity:0.55;"></span>`;
   const borderWidth = options.mine || options.nonApp ? 3 : 2;
   const borderStyle = options.nonApp ? "dashed" : "solid";
   return L.divIcon({
-    className: "ev-marker-icon",
+    className: parked ? "ev-marker-icon ev-marker-parked" : "ev-marker-icon",
     html: `
       <div style="position:relative;width:${size}px;height:${size}px;">
         ${ping}
-        <div style="position:relative;width:${size}px;height:${size}px;border-radius:9999px;background:${color};border:${borderWidth}px ${borderStyle} ${ringColor};display:flex;align-items:center;justify-content:center;box-shadow:0 0 8px ${ringColor};">
-          ${EV_ICON_HTML}
+        <div style="position:relative;width:${size}px;height:${size}px;border-radius:9999px;background:${color};border:${borderWidth}px ${borderStyle} ${ringColor};display:flex;align-items:center;justify-content:center;${options.lite ? "" : `box-shadow:0 0 8px ${ringColor};`}">
+          ${parked ? EV_ICON_SMALL_HTML : EV_ICON_HTML}
         </div>
-        ${stateBadgeHtml(state)}
+        ${stateBadgeHtml(state, options.lite)}
       </div>
     `,
     iconSize: [size, size],
-    iconAnchor: [size / 2, size / 2],
+    // Shifting the anchor moves the icon by (dx, dy) pixels while the
+    // marker itself stays at the vehicle's exact coordinate.
+    iconAnchor: [size / 2 - dx, size / 2 - dy],
+    tooltipAnchor: [dx, dy - size / 2],
   });
 }
 
-const VEHICLE_ICONS: Record<VehicleUpdate["state"], L.DivIcon> = {
-  TRAVELING: buildVehicleIcon(VEHICLE_COLORS.TRAVELING, "TRAVELING"),
-  WAITING: buildVehicleIcon(VEHICLE_COLORS.WAITING, "WAITING"),
-  CHARGING: buildVehicleIcon(VEHICLE_COLORS.CHARGING, "CHARGING"),
-  RETURNING_TO_DEPOT: buildVehicleIcon(VEHICLE_COLORS.RETURNING_TO_DEPOT, "RETURNING_TO_DEPOT"),
-  COMPLETED: buildVehicleIcon(VEHICLE_COLORS.COMPLETED, "COMPLETED"),
-  FAILED: buildVehicleIcon(VEHICLE_COLORS.FAILED, "FAILED"),
-};
+// Icons are rebuilt only for a new (state, kind, slot) combination.
+const vehicleIconCache = new Map<string, L.DivIcon>();
 
-const NON_APP_ICONS: Record<VehicleUpdate["state"], L.DivIcon> = {
-  TRAVELING: buildVehicleIcon(VEHICLE_COLORS.TRAVELING, "TRAVELING", { nonApp: true }),
-  WAITING: buildVehicleIcon(VEHICLE_COLORS.WAITING, "WAITING", { nonApp: true }),
-  CHARGING: buildVehicleIcon(VEHICLE_COLORS.CHARGING, "CHARGING", { nonApp: true }),
-  RETURNING_TO_DEPOT: buildVehicleIcon(VEHICLE_COLORS.RETURNING_TO_DEPOT, "RETURNING_TO_DEPOT", { nonApp: true }),
-  COMPLETED: buildVehicleIcon(VEHICLE_COLORS.COMPLETED, "COMPLETED", { nonApp: true }),
-  FAILED: buildVehicleIcon(VEHICLE_COLORS.FAILED, "FAILED", { nonApp: true }),
-};
-
-const MY_CAR_ICONS: Record<VehicleUpdate["state"], L.DivIcon> = {
-  TRAVELING: buildVehicleIcon(VEHICLE_COLORS.TRAVELING, "TRAVELING", { mine: true }),
-  WAITING: buildVehicleIcon(VEHICLE_COLORS.WAITING, "WAITING", { mine: true }),
-  CHARGING: buildVehicleIcon(VEHICLE_COLORS.CHARGING, "CHARGING", { mine: true }),
-  RETURNING_TO_DEPOT: buildVehicleIcon(VEHICLE_COLORS.RETURNING_TO_DEPOT, "RETURNING_TO_DEPOT", { mine: true }),
-  COMPLETED: buildVehicleIcon(VEHICLE_COLORS.COMPLETED, "COMPLETED", { mine: true }),
-  FAILED: buildVehicleIcon(VEHICLE_COLORS.FAILED, "FAILED", { mine: true }),
-};
+function vehicleIcon(state: VehicleUpdate["state"], options: VehicleIconOptions): L.DivIcon {
+  const key = `${state}|${options.mine ? 1 : 0}|${options.nonApp ? 1 : 0}|${options.lite ? 1 : 0}|${options.offset?.join(",") ?? "-"}`;
+  let icon = vehicleIconCache.get(key);
+  if (!icon) {
+    icon = buildVehicleIcon(VEHICLE_COLORS[state], state, options);
+    vehicleIconCache.set(key, icon);
+  }
+  return icon;
+}
 
 const STATION_ICON = L.divIcon({
   className: "station-marker-icon",
@@ -202,12 +260,53 @@ const DEPOT_ICON = L.divIcon({
 
 const MUTED_ROAD_COLOR = "#9ca3af";
 const MUTED_ROAD_OPACITY = 0.4;
-const MUTED_ROAD_WEIGHT = 6;
 const STATION_SPUR_COLOR = "#ea580c";
 const DEPOT_SPUR_COLOR = "#334155";
 
-function trafficColor(weight: number, maxWeight: number): string {
+// Line weight per OSM road class, shared by the background road layer and
+// the traffic-colored routing edges, so a primary road reads thicker than a
+// residential street or an alley.
+const ROAD_WEIGHTS: Record<string, number> = {
+  motorway: 7, motorway_link: 4, trunk: 7, trunk_link: 4,
+  primary: 6, primary_link: 4, secondary: 5, secondary_link: 3.5,
+  tertiary: 4, tertiary_link: 3, unclassified: 3, residential: 3,
+  living_street: 2.5, road: 2.5, service: 1.6,
+};
+const DEFAULT_ROAD_WEIGHT = 3;
+// Background layer: every drivable street, in neutral tones, darker for
+// bigger roads.
+const BACKGROUND_ROAD_COLORS: Record<string, string> = {
+  motorway: "#475569", trunk: "#475569", primary: "#475569",
+  secondary: "#64748b", tertiary: "#64748b",
+};
+const BACKGROUND_ROAD_DEFAULT_COLOR = "#94a3b8";
+
+function roadWeight(highway: string | null | undefined): number {
+  return (highway && ROAD_WEIGHTS[highway]) || DEFAULT_ROAD_WEIGHT;
+}
+
+function backgroundRoadColor(highway: string): string {
+  return BACKGROUND_ROAD_COLORS[highway.replace(/_link$/, "")] ?? BACKGROUND_ROAD_DEFAULT_COLOR;
+}
+
+// Streets are drawn in merged per-style groups (StaticRoadLayers), so the
+// continuous green -> red congestion scale is quantized into this many steps.
+const TRAFFIC_COLOR_BUCKETS = 10;
+// The dashed underlay is drawn only up to this many routing edges (the small
+// scenario has ~500; the large one's full network ~9.5k).
+const DASHED_UNDERLAY_MAX_EDGES = 2000;
+// Own pane for the street canvas, below Leaflet's overlayPane (400), so
+// spurs, decorative traffic and the preview route stay on top of it.
+const ROADS_PANE = "static-roads";
+const ROADS_PANE_Z_INDEX = "350";
+
+function trafficBucket(weight: number, maxWeight: number): number {
   const ratio = maxWeight > 0 ? Math.min(Math.max(weight / maxWeight, 0), 1) : 0;
+  return Math.min(Math.floor(ratio * TRAFFIC_COLOR_BUCKETS), TRAFFIC_COLOR_BUCKETS - 1);
+}
+
+function trafficBucketColor(bucket: number): string {
+  const ratio = (bucket + 0.5) / TRAFFIC_COLOR_BUCKETS;
   const hue = 120 - 120 * ratio; // 120=green (thông thoáng) -> 0=red (tắc)
   return `hsl(${hue.toFixed(0)}, 75%, 45%)`;
 }
@@ -403,13 +502,6 @@ export default function MapComponent({
     return Math.max(...network.edges.map((e) => e.traffic_weight), 0.0001);
   }, [network]);
 
-  const center = useMemo<LatLngTuple>(() => {
-    if (!network || network.nodes.length === 0) return FALLBACK_CENTER;
-    const avgLng = network.nodes.reduce((sum, n) => sum + n.x, 0) / network.nodes.length;
-    const avgLat = network.nodes.reduce((sum, n) => sum + n.y, 0) / network.nodes.length;
-    return [avgLat, avgLng];
-  }, [network]);
-
   if (!network) {
     return (
       <div className="flex h-full w-full items-center justify-center text-sm text-gray-500">
@@ -418,66 +510,21 @@ export default function MapComponent({
     );
   }
 
-  function displayPositionFor(vehicle: VehicleUpdate): LatLngTuple {
-    const [lat, lng] = toLatLng(vehicle.x, vehicle.y);
-    // Once actually arrived, vehicle.x/y already IS the station/depot POI
-    // node's own real position (a real graph node reached via a real spur
-    // edge -- see network_graph.py's _add_poi_nodes) -- only a small
-    // per-vehicle spread is added on top so several cars at the same spot
-    // don't render as one overlapping icon.
-    if (vehicle.state === "COMPLETED") {
-      const [dLat, dLng] = goldenAngleOffset(vehicle.id, PARKED_CLUSTER_RADIUS_DEGREES);
-      return [lat + dLat, lng + dLng];
-    }
-    if (vehicle.state === "WAITING" || vehicle.state === "CHARGING") {
-      const radius = vehicle.state === "CHARGING" ? CHARGING_CLUSTER_RADIUS_DEGREES : QUEUE_CLUSTER_RADIUS_DEGREES;
-      const [dLat, dLng] = goldenAngleOffset(vehicle.id, radius);
-      return [lat + dLat, lng + dLng];
-    }
-    // TRAVELING and RETURNING_TO_DEPOT both render at the real, actively
-    // moving position the backend reports -- no offset, since they're
-    // genuinely in motion (this also covers a vehicle crawling along a
-    // spur edge into or out of a station/depot).
-    return [lat, lng];
-  }
+  // Every marker is placed at the exact coordinate the backend reports;
+  // cars parked at a node only get their icon shifted (see parkedOffsets).
+  // Cars already faded out free their slot.
+  const visibleVehicles = vehicles.filter((vehicle) => !isHidden(vehicle));
+  const iconOffsets = parkedOffsets(visibleVehicles);
+  const liteIcons = visibleVehicles.length > LITE_ICON_VEHICLE_THRESHOLD;
 
   return (
-    <MapContainer center={center} zoom={DEFAULT_ZOOM} className="h-full w-full rounded-lg">
+    // Canvas renderer: the full road layer is a few thousand polylines,
+    // far cheaper to draw on one canvas than as SVG paths.
+    <MapContainer center={FALLBACK_CENTER} zoom={DEFAULT_ZOOM} preferCanvas className="h-full w-full rounded-lg">
       <TileLayer url={TILE_URL} attribution={TILE_ATTRIBUTION} />
+      <FitToNetwork network={network} />
 
-      {/* Z-order 1 (bottom): muted dashed underlay over every real road
-          edge -- the "ground truth" geometry vehicles/stations/depots all
-          visibly stick to. */}
-      {[...roadEdgePositions.entries()].map(([key, positions]) => (
-        <Polyline
-          key={`road-muted-${key}`}
-          positions={positions}
-          pathOptions={{
-            color: MUTED_ROAD_COLOR,
-            opacity: MUTED_ROAD_OPACITY,
-            weight: MUTED_ROAD_WEIGHT,
-            dashArray: "2 8",
-          }}
-        />
-      ))}
-
-      {/* Z-order 2: the same road edges, colored by traffic congestion. */}
-      {network.edges.map((edge) => {
-        const key = edgeKey(edge.source, edge.target);
-        const positions = roadEdgePositions.get(key);
-        if (!positions) return null;
-        return (
-          <Polyline
-            key={`edge-${key}`}
-            positions={positions}
-            pathOptions={{
-              color: trafficColor(edge.traffic_weight, maxTrafficWeight),
-              weight: 3,
-              opacity: 0.65,
-            }}
-          />
-        );
-      })}
+      <StaticRoadLayers network={network} roadEdgePositions={roadEdgePositions} maxTrafficWeight={maxTrafficWeight} />
 
       {fakeTraffic.map((car) => (
         <CircleMarker
@@ -552,30 +599,152 @@ export default function MapComponent({
         );
       })}
 
-      {/* Z-order 5 (top): vehicles. */}
-      {vehicles
-        .filter((vehicle) => !isHidden(vehicle))
-        .map((vehicle) => {
-          const isMine = vehicle.id === myVehicleId;
-          const icon = (isMine ? MY_CAR_ICONS : vehicle.is_non_app ? NON_APP_ICONS : VEHICLE_ICONS)[
-            vehicle.state
-          ];
-          const opacity = isFading(vehicle) ? 0 : 1;
-          return (
-            <Marker
-              key={`vehicle-${vehicle.id}`}
-              position={displayPositionFor(vehicle)}
-              icon={icon}
-              opacity={opacity}
-            >
-              <Tooltip direction="top" offset={[0, -14]}>
-                {isMine ? "★ Xe của tôi — " : ""}EV {vehicle.id}
-                {vehicle.is_non_app ? " (Non-App)" : ""} — {vehicle.state} — battery{" "}
-                {(vehicle.battery * 100).toFixed(0)}%
-              </Tooltip>
-            </Marker>
-          );
-        })}
+      {/* Z-order 5 (top): vehicles, always stacked above station/depot
+          icons (zIndexOffset). */}
+      {visibleVehicles.map((vehicle) => {
+        const isMine = vehicle.id === myVehicleId;
+        const icon = vehicleIcon(vehicle.state, {
+          mine: isMine,
+          nonApp: vehicle.is_non_app,
+          offset: iconOffsets.get(vehicle.id),
+          lite: liteIcons && !isMine,
+        });
+        const opacity = isFading(vehicle) ? 0 : 1;
+        return (
+          <Marker
+            key={`vehicle-${vehicle.id}`}
+            position={toLatLng(vehicle.x, vehicle.y)}
+            icon={icon}
+            opacity={opacity}
+            zIndexOffset={isMine ? MY_CAR_Z_INDEX_OFFSET : VEHICLE_Z_INDEX_OFFSET}
+          >
+            <Tooltip direction="top" offset={[0, -2]}>
+              {isMine ? "★ Xe của tôi — " : ""}EV {vehicle.id}
+              {vehicle.is_non_app ? " (Non-App)" : ""} — {vehicle.state} — battery{" "}
+              {(vehicle.battery * 100).toFixed(0)}%
+            </Tooltip>
+          </Marker>
+        );
+      })}
+      <MapLegend />
     </MapContainer>
+  );
+}
+
+// Fits the camera to the network's bounds once per scenario: on first load
+// and on every scenario switch (the large map covers ~4x the area), but not
+// on a new episode of the same scenario, so a user's own pan/zoom survives
+// resets.
+function FitToNetwork({ network }: { network: NetworkInfo }) {
+  const map = useMap();
+  const fittedScenario = useRef<string | null>(null);
+  useEffect(() => {
+    if (fittedScenario.current === network.scenario || network.nodes.length === 0) return;
+    fittedScenario.current = network.scenario;
+    const bounds = L.latLngBounds(network.nodes.map((node) => toLatLng(node.x, node.y)));
+    map.fitBounds(bounds, { padding: FIT_PADDING_PX });
+  }, [map, network]);
+  return null;
+}
+
+interface StaticRoadLayersProps {
+  network: NetworkInfo;
+  roadEdgePositions: Map<string, LatLngTuple[]>;
+  maxTrafficWeight: number;
+}
+
+// Every street the backend sends, drawn in full: the display road layer and
+// every routing edge (the large scenario: ~9.5k edges plus ~9.5k display
+// roads). One Leaflet layer per street made the large map lag, so streets
+// sharing a style are merged into one multi-polyline (a few dozen layers in
+// total; traffic colors are quantized into TRAFFIC_COLOR_BUCKETS steps),
+// drawn on a canvas of their own, in a pane below the overlay pane. Moving
+// vehicles and decorative traffic therefore never trigger a redraw of the
+// streets; only pan/zoom or a new network does. Built imperatively, once
+// per network, outside React's per-tick re-render.
+function StaticRoadLayers({ network, roadEdgePositions, maxTrafficWeight }: StaticRoadLayersProps) {
+  const map = useMap();
+  useEffect(() => {
+    if (!map.getPane(ROADS_PANE)) {
+      const pane = map.createPane(ROADS_PANE);
+      pane.style.zIndex = ROADS_PANE_Z_INDEX;
+      pane.style.pointerEvents = "none";
+    }
+    const renderer = L.canvas({ pane: ROADS_PANE });
+    const groups = new Map<string, { options: L.PolylineOptions; lines: LatLngTuple[][] }>();
+    const add = (key: string, options: L.PolylineOptions, line: LatLngTuple[]) => {
+      let group = groups.get(key);
+      if (!group) {
+        group = { options, lines: [] };
+        groups.set(key, group);
+      }
+      group.lines.push(line);
+    };
+
+    // Z-order 0 (bottom): every drivable street of the extract, alleys
+    // included, weighted by road class.
+    for (const road of network.roads ?? []) {
+      const color = backgroundRoadColor(road.highway);
+      const weight = roadWeight(road.highway);
+      add(`road|${color}|${weight}`, { color, weight, opacity: 0.55 }, road.geometry);
+    }
+    const routingEdges = network.edges.flatMap((edge) => {
+      const positions = roadEdgePositions.get(edgeKey(edge.source, edge.target));
+      return positions ? [{ edge, positions }] : [];
+    });
+    // Z-order 1: muted dashed underlay over every routing edge -- the
+    // "ground truth" geometry vehicles/stations/depots all visibly stick
+    // to. Skipped on a full-city network, where it would only double the
+    // drawing work under lines that already cover it.
+    if (routingEdges.length <= DASHED_UNDERLAY_MAX_EDGES) {
+      for (const { edge, positions } of routingEdges) {
+        const weight = roadWeight(edge.highway) + 3;
+        add(
+          `muted|${weight}`,
+          { color: MUTED_ROAD_COLOR, opacity: MUTED_ROAD_OPACITY, weight, dashArray: "2 8" },
+          positions,
+        );
+      }
+    }
+    // Z-order 2: the same routing edges, colored by traffic congestion and
+    // weighted by road class.
+    for (const { edge, positions } of routingEdges) {
+      const bucket = trafficBucket(edge.traffic_weight, maxTrafficWeight);
+      const weight = roadWeight(edge.highway);
+      add(`traffic|${bucket}|${weight}`, { color: trafficBucketColor(bucket), weight, opacity: 0.8 }, positions);
+    }
+
+    const layer = L.layerGroup(
+      [...groups.values()].map(({ options, lines }) =>
+        L.polyline(lines, { ...options, renderer, interactive: false }),
+      ),
+    ).addTo(map);
+    return () => {
+      layer.remove();
+      renderer.remove();
+    };
+  }, [map, network, roadEdgePositions, maxTrafficWeight]);
+  return null;
+}
+
+function MapLegend() {
+  const swatch = (color: string, height: number) => (
+    <span className="inline-block w-6 rounded-sm align-middle" style={{ height, background: color }} />
+  );
+  return (
+    <div className="pointer-events-none absolute bottom-6 left-2 z-[1000] rounded-md bg-white/90 px-2.5 py-2 text-[11px] leading-5 text-gray-700 shadow dark:bg-gray-900/90 dark:text-gray-200">
+      <div className="flex items-center gap-2">
+        <span className="inline-block h-1.5 w-6 rounded-sm" style={{ background: "linear-gradient(90deg, hsl(120,75%,45%), hsl(60,75%,45%), hsl(0,75%,45%))" }} />
+        Đường xe chạy trong mô phỏng (màu = mức tắc)
+      </div>
+      <div className="flex items-center gap-2">
+        {swatch(BACKGROUND_ROAD_COLORS.primary, 4)}
+        Đường lớn (nền bản đồ)
+      </div>
+      <div className="flex items-center gap-2">
+        {swatch(BACKGROUND_ROAD_DEFAULT_COLOR, 2)}
+        Ngõ / đường nhỏ (nền bản đồ)
+      </div>
+    </div>
   );
 }

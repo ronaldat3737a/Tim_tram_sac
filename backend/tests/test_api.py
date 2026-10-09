@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from backend.api import simulation_manager as simulation_manager_module
 from backend.api.main import create_app
 from backend.config import DEFAULT_CONFIG
+from backend.tests.scenario_helpers import single_scenario, two_scenarios
 
 TEST_CONFIG = replace(
     DEFAULT_CONFIG, num_stations=2, num_vehicles=5, max_episode_steps=800
@@ -18,7 +19,7 @@ FAST_SPEED = 2000.0  # ticks/sec -- keeps background-thread pacing negligible in
 
 
 def test_cors_allows_frontend_dev_origin():
-    with TestClient(create_app(TEST_CONFIG)) as client:
+    with TestClient(create_app(single_scenario(TEST_CONFIG))) as client:
         response = client.get(
             "/api/simulation/status", headers={"Origin": "http://localhost:3000"}
         )
@@ -28,7 +29,7 @@ def test_cors_allows_frontend_dev_origin():
 
 
 def test_read_root():
-    with TestClient(create_app(TEST_CONFIG)) as client:
+    with TestClient(create_app(single_scenario(TEST_CONFIG))) as client:
         response = client.get("/")
 
     assert response.status_code == 200
@@ -36,7 +37,7 @@ def test_read_root():
 
 
 def test_get_network_matches_config_scale():
-    with TestClient(create_app(TEST_CONFIG)) as client:
+    with TestClient(create_app(single_scenario(TEST_CONFIG))) as client:
         response = client.get("/api/network")
 
     assert response.status_code == 200
@@ -54,7 +55,7 @@ def test_get_network_matches_config_scale():
 
 
 def test_initial_status_is_paused_before_any_start_call():
-    with TestClient(create_app(TEST_CONFIG)) as client:
+    with TestClient(create_app(single_scenario(TEST_CONFIG))) as client:
         response = client.get("/api/simulation/status")
 
     assert response.status_code == 200
@@ -64,7 +65,7 @@ def test_initial_status_is_paused_before_any_start_call():
 
 
 def test_start_pause_resume_reset_flow():
-    with TestClient(create_app(TEST_CONFIG)) as client:
+    with TestClient(create_app(single_scenario(TEST_CONFIG))) as client:
         start_response = client.post(
             "/api/simulation/start",
             json={"seed": 5, "algorithm": "nearest_station", "speed": FAST_SPEED},
@@ -85,7 +86,7 @@ def test_start_pause_resume_reset_flow():
 
 
 def test_episode_metrics_accumulate_then_reset_to_zero():
-    with TestClient(create_app(TEST_CONFIG)) as client:
+    with TestClient(create_app(single_scenario(TEST_CONFIG))) as client:
         client.post(
             "/api/simulation/start",
             json={"seed": 5, "algorithm": "nearest_station", "speed": FAST_SPEED},
@@ -115,7 +116,7 @@ def test_start_with_invalid_algorithm_returns_422():
     # "algorithm" is a Pydantic Literal, so an unknown value fails request
     # body validation (422) before ever reaching the manager's own 400 checks
     # (e.g. the DQN-model-missing case below, which IS a valid Literal).
-    with TestClient(create_app(TEST_CONFIG)) as client:
+    with TestClient(create_app(single_scenario(TEST_CONFIG))) as client:
         response = client.post(
             "/api/simulation/start", json={"algorithm": "not_a_real_algorithm", "speed": FAST_SPEED}
         )
@@ -128,9 +129,9 @@ def test_start_with_dqn_but_no_trained_model_falls_back_to_baseline(monkeypatch,
     # background thread: the episode runs on the fallback baseline instead,
     # and status reports that baseline, not "dqn", so the dashboard never
     # labels baseline results as DQN.
-    monkeypatch.setattr(simulation_manager_module, "DQN_MODEL_PATH", tmp_path / "missing.zip")
+    scenarios = single_scenario(TEST_CONFIG, dqn_model_path=str(tmp_path / "missing.zip"))
 
-    with TestClient(create_app(TEST_CONFIG)) as client:
+    with TestClient(create_app(scenarios)) as client:
         response = client.post(
             "/api/simulation/start", json={"algorithm": "dqn", "speed": FAST_SPEED}
         )
@@ -148,9 +149,9 @@ def _save_untrained_mappo_model(path, config):
 
 def test_start_with_mappo_but_no_trained_model_returns_400(monkeypatch, tmp_path):
     # No silent baseline fallback for MAPPO: the UI gets the reason instead.
-    monkeypatch.setattr(simulation_manager_module, "MAPPO_MODEL_PATH", tmp_path / "missing.pth")
+    scenarios = single_scenario(TEST_CONFIG, mappo_model_path=str(tmp_path / "missing.pth"))
 
-    with TestClient(create_app(TEST_CONFIG)) as client:
+    with TestClient(create_app(scenarios)) as client:
         response = client.post("/api/simulation/start", json={"algorithm": "mappo", "speed": FAST_SPEED})
         status = client.get("/api/simulation/status").json()
 
@@ -163,9 +164,9 @@ def test_start_with_mappo_runs_the_multi_agent_env(monkeypatch, tmp_path):
     from backend.ai_core.marl_env import MultiAgentEVEnv
 
     model_path = _save_untrained_mappo_model(tmp_path / "mappo.pth", TEST_CONFIG)
-    monkeypatch.setattr(simulation_manager_module, "MAPPO_MODEL_PATH", model_path)
+    scenarios = single_scenario(TEST_CONFIG, mappo_model_path=str(model_path))
 
-    with TestClient(create_app(TEST_CONFIG)) as client:
+    with TestClient(create_app(scenarios)) as client:
         response = client.post(
             "/api/simulation/start", json={"seed": 5, "algorithm": "mappo", "speed": FAST_SPEED}
         )
@@ -183,7 +184,7 @@ def test_start_with_mappo_runs_the_multi_agent_env(monkeypatch, tmp_path):
 
 
 def test_speed_endpoint_updates_reported_speed():
-    with TestClient(create_app(TEST_CONFIG)) as client:
+    with TestClient(create_app(single_scenario(TEST_CONFIG))) as client:
         response = client.post("/api/simulation/speed", json={"speed": 10.0})
 
     assert response.status_code == 200
@@ -191,14 +192,14 @@ def test_speed_endpoint_updates_reported_speed():
 
 
 def test_speed_endpoint_rejects_non_positive_speed():
-    with TestClient(create_app(TEST_CONFIG)) as client:
+    with TestClient(create_app(single_scenario(TEST_CONFIG))) as client:
         response = client.post("/api/simulation/speed", json={"speed": 0.0})
 
     assert response.status_code == 400
 
 
 def test_websocket_streams_simulation_update_matching_schema():
-    with TestClient(create_app(TEST_CONFIG)) as client:
+    with TestClient(create_app(single_scenario(TEST_CONFIG))) as client:
         client.post(
             "/api/simulation/start",
             json={"seed": 3, "algorithm": "nearest_station", "speed": FAST_SPEED},
@@ -222,7 +223,7 @@ def test_websocket_streams_simulation_update_matching_schema():
 
 
 def test_repeated_websocket_connect_disconnect_does_not_leak_threads():
-    with TestClient(create_app(TEST_CONFIG)) as client:
+    with TestClient(create_app(single_scenario(TEST_CONFIG))) as client:
         client.post(
             "/api/simulation/start",
             json={"seed": 3, "algorithm": "nearest_station", "speed": FAST_SPEED},
@@ -248,7 +249,7 @@ def test_rapid_pause_resume_reset_cycles_stay_consistent():
     # (see test_reset_with_degenerate_seed_returns_400_without_corrupting_state
     # for the dedicated, deliberately-degenerate-seed case).
     config = replace(TEST_CONFIG, num_vehicles=20)
-    with TestClient(create_app(config)) as client:
+    with TestClient(create_app(single_scenario(config))) as client:
         client.post(
             "/api/simulation/start",
             json={"seed": 5, "algorithm": "nearest_station", "speed": FAST_SPEED},
@@ -288,7 +289,7 @@ def test_reset_with_degenerate_seed_returns_400_without_corrupting_state(monkeyp
 
     monkeypatch.setattr(EVEnv, "reset", flaky_reset)
 
-    with TestClient(create_app(TEST_CONFIG)) as client:
+    with TestClient(create_app(single_scenario(TEST_CONFIG))) as client:
         good_status = client.post(
             "/api/simulation/start",
             json={"seed": 3, "algorithm": "nearest_station", "speed": FAST_SPEED},
@@ -309,7 +310,7 @@ def test_reset_with_degenerate_seed_returns_400_without_corrupting_state(monkeyp
 
 
 def test_status_reports_a_valid_my_vehicle_id():
-    with TestClient(create_app(TEST_CONFIG)) as client:
+    with TestClient(create_app(single_scenario(TEST_CONFIG))) as client:
         status = client.get("/api/simulation/status").json()
 
     assert status["my_vehicle_id"] is not None
@@ -317,7 +318,7 @@ def test_status_reports_a_valid_my_vehicle_id():
 
 
 def test_my_car_preview_returns_station_and_route():
-    with TestClient(create_app(TEST_CONFIG)) as client:
+    with TestClient(create_app(single_scenario(TEST_CONFIG))) as client:
         status = client.post(
             "/api/simulation/start",
             json={"seed": 5, "algorithm": "nearest_station", "speed": FAST_SPEED},
@@ -339,7 +340,7 @@ def test_my_car_preview_returns_station_and_route():
 def test_my_car_preview_does_not_dispatch_the_vehicle():
     # Calling preview repeatedly must never assign a station itself -- only
     # the automatic dispatch loop does that (section 20).
-    with TestClient(create_app(TEST_CONFIG)) as client:
+    with TestClient(create_app(single_scenario(TEST_CONFIG))) as client:
         client.post(
             "/api/simulation/start",
             json={"seed": 5, "algorithm": "nearest_station", "speed": FAST_SPEED},
@@ -352,3 +353,41 @@ def test_my_car_preview_does_not_dispatch_the_vehicle():
         vehicle = manager.env.simulator.vehicles[manager.my_vehicle_id]
         assert vehicle.target_station is None
         assert vehicle.state.value == "TRAVELING"
+
+
+def test_scenarios_endpoint_lists_every_scenario():
+    larger = replace(TEST_CONFIG, num_stations=4)
+    with TestClient(create_app(two_scenarios(TEST_CONFIG, larger))) as client:
+        scenarios = client.get("/api/scenarios").json()
+
+    assert [s["name"] for s in scenarios] == ["small", "large"]
+    assert scenarios[1]["num_stations"] == 4
+    assert scenarios[1]["label"]
+
+
+def test_switching_scenario_changes_status_and_network():
+    larger = replace(TEST_CONFIG, num_stations=4)
+    with TestClient(create_app(two_scenarios(TEST_CONFIG, larger))) as client:
+        assert client.get("/api/network").json()["scenario"] == "small"
+
+        response = client.post("/api/simulation/scenario", json={"scenario": "large"})
+        network = client.get("/api/network").json()
+
+    assert response.status_code == 200
+    assert response.json()["scenario"] == "large"
+    assert response.json()["status"] == "paused"
+    assert network["scenario"] == "large"
+    assert len(network["stations"]) == 4
+
+
+def test_start_can_switch_scenario_and_rejects_unknown_ones():
+    larger = replace(TEST_CONFIG, num_stations=4)
+    with TestClient(create_app(two_scenarios(TEST_CONFIG, larger))) as client:
+        started = client.post(
+            "/api/simulation/start", json={"algorithm": "nearest_station", "speed": FAST_SPEED, "scenario": "large"}
+        )
+        unknown = client.post("/api/simulation/scenario", json={"scenario": "huge"})
+        client.post("/api/simulation/pause")
+
+    assert started.status_code == 200 and started.json()["scenario"] == "large"
+    assert unknown.status_code == 400

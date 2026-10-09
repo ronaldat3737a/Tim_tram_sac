@@ -228,3 +228,50 @@ def test_global_state_ends_with_episode_time_progress():
     assert progress[-1] == pytest.approx(
         min(env.simulator.simulation_time / MARL_CONFIG.max_episode_steps, 1.0)
     )
+
+
+def _reset_to_a_multi_agent_batch(env):
+    for seed in range(50):
+        env.reset(seed=seed)
+        while env.agents and len(env.agents) < 2:
+            env.step({agent: 0 for agent in env.agents})
+        if len(env.agents) >= 2:
+            return
+    pytest.fail("no decision batch with two or more agents found")
+
+
+def test_decide_sequentially_shows_each_agent_the_earlier_picks_then_restores_the_env():
+    env = MultiAgentEVEnv(MARL_CONFIG, decision_window=200)
+    _reset_to_a_multi_agent_batch(env)
+    stations = [env.simulator.stations[env.station_id_for_action(a)] for a in range(2)]
+    incoming_before = [s.incoming_count for s in stations]
+    available_index = 5 + 5  # station 0: x, y, distance, travel_time, queue, [available], traffic
+    seen = []
+
+    actions, observations = env.decide_sequentially(lambda obs: (seen.append(obs), 0)[1])
+
+    assert list(actions) == env.agents and set(actions.values()) == {0}
+    assert np.array_equal(observations, np.stack(seen))
+    # Every pick of station 0 lowered its available capacity for the next agent.
+    capacity = stations[0].capacity
+    for i in range(1, len(seen)):
+        expected_drop = min(1 / capacity, seen[i - 1][available_index])
+        assert seen[i][available_index] == pytest.approx(seen[i - 1][available_index] - expected_drop)
+    # Nothing was dispatched: the reservations were undone.
+    assert [s.incoming_count for s in stations] == incoming_before
+    # And step() then dispatches exactly those picks.
+    agents = list(actions)
+    _, _, _, _, infos = env.step(actions)
+    assert {infos[agent]["requested_station_id"] for agent in agents} == {stations[0].station_id}
+
+
+def test_decide_sequentially_rejects_an_out_of_range_action_without_side_effects():
+    env = MultiAgentEVEnv(MARL_CONFIG, decision_window=200)
+    _reset_to_a_multi_agent_batch(env)
+    incoming_before = {sid: s.incoming_count for sid, s in env.simulator.stations.items()}
+    picks = iter([0, 99])
+
+    with pytest.raises(ValueError):
+        env.decide_sequentially(lambda obs: next(picks))
+
+    assert {sid: s.incoming_count for sid, s in env.simulator.stations.items()} == incoming_before

@@ -1,13 +1,15 @@
 """DQN training entry point (PROJECT_SPEC.md sections 31, 46 Phase 5).
 
-Trains on OSM_DEMO_CONFIG (the real Nghia Do street map the API serves) and
-saves to models/dqn_osm_model.zip, the path backend/api/simulation_manager.py
-loads.
+Trains on one scenario's config (backend/config.SCENARIOS; default
+"small" = OSM_DEMO_CONFIG, the real Nghia Do street map) and saves to that
+scenario's dqn_model_path (models/dqn_osm_model.zip for "small"), the file
+backend/api/simulation_manager.py loads for it.
 
 Run (from the repo root):
     python backend/ai_core/train.py --smoke-test
     python backend/ai_core/train.py                      # 500k steps (default)
     python backend/ai_core/train.py --n-envs 2           # fewer parallel envs
+    python backend/ai_core/train.py --scenario large     # 20 stations / 200 EVs
     tensorboard --logdir ./logs/
 
 Training never runs inside FastAPI (section 36) -- this is a standalone CLI.
@@ -34,7 +36,7 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecEnv
 
 from backend.ai_core.ev_env import EVEnv
-from backend.config import OSM_DEMO_CONFIG, SimulationConfig
+from backend.config import DEFAULT_SCENARIO, OSM_DEMO_CONFIG, SCENARIOS, SimulationConfig, get_scenario
 
 DEFAULT_NET_ARCH = [64, 64]
 # One gradient step per this many transitions, whatever the env count.
@@ -44,7 +46,6 @@ TRANSITIONS_PER_UPDATE = 4
 N_ENVS = 4
 MODELS_DIR = Path("models")
 TENSORBOARD_LOG_DIR = Path("logs")
-DEFAULT_OUTPUT_NAME = "dqn_osm_model"
 
 
 class RandomScenarioPerEpisode(gym.Wrapper):
@@ -208,27 +209,30 @@ def train(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train DQN for EV charging-station dispatch.")
+    parser.add_argument("--scenario", choices=sorted(SCENARIOS), default=DEFAULT_SCENARIO,
+                        help="Which config to train on; also picks the default output file.")
     parser.add_argument("--smoke-test", action="store_true", help="Run the Phase 5 pre-training checks instead of full training.")
     parser.add_argument("--smoke-timesteps", type=int, default=1000)
     parser.add_argument("--total-timesteps", type=int, default=500_000)
     parser.add_argument("--seed", type=int, default=OSM_DEMO_CONFIG.random_seed)
     parser.add_argument("--checkpoint-freq", type=int, default=10_000)
     parser.add_argument("--net-arch", type=int, nargs="+", default=DEFAULT_NET_ARCH)
-    parser.add_argument("--output", type=str, default=DEFAULT_OUTPUT_NAME)
+    parser.add_argument("--output", type=str, default=None, help="Default: the scenario's dqn_model_path name.")
     parser.add_argument("--n-envs", type=int, default=N_ENVS, help="Parallel environment subprocesses (SubprocVecEnv).")
     args = parser.parse_args()
+    scenario = get_scenario(args.scenario)
 
     if args.smoke_test:
-        run_smoke_test(OSM_DEMO_CONFIG, args.seed, args.net_arch, args.smoke_timesteps, args.n_envs)
+        run_smoke_test(scenario.config, args.seed, args.net_arch, args.smoke_timesteps, args.n_envs)
         return
 
     train(
-        OSM_DEMO_CONFIG,
+        scenario.config,
         args.seed,
         args.total_timesteps,
         args.net_arch,
         args.checkpoint_freq,
-        args.output,
+        args.output or Path(scenario.dqn_model_path).stem,
         args.n_envs,
     )
 

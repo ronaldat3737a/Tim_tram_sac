@@ -19,6 +19,7 @@ Run:
     python -m backend.ai_core.evaluate
     python -m backend.ai_core.evaluate --model-path models/dqn_osm_model.zip --seeds 1000 1001 1002
     python -m backend.ai_core.evaluate --mappo-model-path models/mappo_osm_model.pth
+    python -m backend.ai_core.evaluate --scenario large   # its own models and results file
 """
 
 from __future__ import annotations
@@ -29,7 +30,6 @@ import statistics
 from dataclasses import asdict
 from pathlib import Path
 
-import numpy as np
 from stable_baselines3 import DQN
 
 from backend.ai_core.mappo import MAPPOAgent
@@ -42,7 +42,7 @@ from backend.baseline.runner import (
     run_baseline_episode,
     run_episode,
 )
-from backend.config import OSM_DEMO_CONFIG, SimulationConfig
+from backend.config import DEFAULT_SCENARIO, SCENARIOS, SimulationConfig, get_scenario
 
 # A fixed, documented, held-out scenario set for fair comparison (sections
 # 29/30). Training (ai_core/train.py's RandomScenarioPerEpisode) draws
@@ -52,7 +52,6 @@ from backend.config import OSM_DEMO_CONFIG, SimulationConfig
 TEST_SEEDS = [1000, 1001, 1002, 1003, 1004]
 
 RESULTS_PATH = Path("results") / "evaluation_comparison.json"
-DEFAULT_MAPPO_MODEL_PATH = Path("models/mappo_osm_model.pth")
 # Used only if the checkpoint does not record the window it was trained with.
 MAPPO_DEFAULT_DECISION_WINDOW = 15
 
@@ -68,7 +67,9 @@ def dqn_action_fn(model: DQN) -> ActionFn:
 def run_mappo_episode(
     config: SimulationConfig, seed: int, agent: MAPPOAgent, decision_window: int
 ) -> EpisodeMetrics:
-    """One MultiAgentEVEnv episode with the shared actor's argmax actions,
+    """One MultiAgentEVEnv episode with the shared actor's argmax actions
+    (deciding each batch the way the model was trained to, see
+    MAPPOAgent.act),
     measured exactly like run_episode, plus each EV's decision-window delay
     added to its own waiting time once its trip resolves."""
     collector = StationMetricsCollector()
@@ -93,8 +94,7 @@ def run_mappo_episode(
     # Dispatched EV -> how long it stood in the window before dispatch.
     pending_delay: dict[int, float] = {}
     while env.agents:
-        agents = list(env.agents)
-        actions, _ = agent.get_action(np.stack([obs[a] for a in agents]), deterministic=True)
+        agents, _, actions, _ = agent.act(env, obs, deterministic=True)
         obs, rewards, _, _, infos = env.step(dict(zip(agents, actions.tolist())))
 
         for a in agents:
@@ -186,21 +186,11 @@ def summarize(metrics_list: list[EpisodeMetrics]) -> dict:
 
 
 def evaluate_all_policies(
-    config: SimulationConfig, seeds: list[int], model_path: Path, mappo_model_path: Path | None = None
+    config: SimulationConfig, seeds: list[int], model_path: Path | None, mappo_model_path: Path | None = None
 ) -> dict[str, dict]:
-    """Baselines and DQN, plus MAPPO when mappo_model_path is given."""
-    if not model_path.exists():
-        raise FileNotFoundError(
-            f"DQN model not found at {model_path}. Train one first with "
-            "`python -m backend.ai_core.train`."
-        )
-    model = DQN.load(str(model_path))
-    if model.action_space.n != config.num_stations:
-        raise ValueError(
-            f"model was trained with {model.action_space.n} stations but config "
-            f"has num_stations={config.num_stations}; evaluation requires the "
-            "same charging-station configuration (section 29)."
-        )
+    """Baselines, plus DQN when model_path is given and MAPPO when
+    mappo_model_path is given."""
+    model = None if model_path is None else _load_dqn_model(config, model_path)
 
     summaries: dict[str, dict] = {}
 
@@ -213,8 +203,9 @@ def evaluate_all_policies(
         metrics_list = [run_baseline_episode(config, seed, policy, name) for seed in seeds]
         summaries[name] = summarize(metrics_list)
 
-    dqn_metrics_list = [run_episode(config, seed, dqn_action_fn(model), "dqn") for seed in seeds]
-    summaries["dqn"] = summarize(dqn_metrics_list)
+    if model is not None:
+        dqn_metrics_list = [run_episode(config, seed, dqn_action_fn(model), "dqn") for seed in seeds]
+        summaries["dqn"] = summarize(dqn_metrics_list)
 
     if mappo_model_path is not None:
         agent = load_mappo_model(config, mappo_model_path)
@@ -222,6 +213,22 @@ def evaluate_all_policies(
         summaries["mappo"] = summarize([run_mappo_episode(config, seed, agent, window) for seed in seeds])
 
     return summaries
+
+
+def _load_dqn_model(config: SimulationConfig, model_path: Path) -> DQN:
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"DQN model not found at {model_path}. Train one first with "
+            "`python -m backend.ai_core.train`."
+        )
+    model = DQN.load(str(model_path))
+    if model.action_space.n != config.num_stations:
+        raise ValueError(
+            f"model was trained with {model.action_space.n} stations but config "
+            f"has num_stations={config.num_stations}; evaluation requires the "
+            "same charging-station configuration (section 29)."
+        )
+    return model
 
 
 def print_comparison_table(summaries: dict[str, dict]) -> None:
@@ -246,28 +253,44 @@ def print_comparison_table(summaries: dict[str, dict]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate DQN and MAPPO against baseline dispatch policies.")
-    parser.add_argument("--model-path", type=str, default="models/dqn_osm_model.zip")
-    parser.add_argument("--mappo-model-path", type=Path, default=DEFAULT_MAPPO_MODEL_PATH)
+    parser.add_argument("--scenario", choices=sorted(SCENARIOS), default=DEFAULT_SCENARIO,
+                        help="Which config to evaluate on; also picks the default model files.")
+    parser.add_argument("--model-path", type=Path, default=None, help="Default: the scenario's dqn_model_path.")
+    parser.add_argument("--mappo-model-path", type=Path, default=None, help="Default: the scenario's mappo_model_path.")
     parser.add_argument("--seeds", type=int, nargs="+", default=TEST_SEEDS)
     args = parser.parse_args()
+    scenario = get_scenario(args.scenario)
 
-    mappo_model_path = args.mappo_model_path
-    if not mappo_model_path.exists():
-        print(
-            f"WARNING: no MAPPO model at {mappo_model_path} -- MAPPO is left out of this comparison. "
-            "Train one with `python -m backend.ai_core.train_mappo`.\n"
-        )
-        mappo_model_path = None
+    model_path = _existing_or_none(args.model_path or Path(scenario.dqn_model_path), "DQN", "train")
+    mappo_model_path = _existing_or_none(
+        args.mappo_model_path or Path(scenario.mappo_model_path), "MAPPO", "train_mappo"
+    )
 
-    summaries = evaluate_all_policies(OSM_DEMO_CONFIG, args.seeds, Path(args.model_path), mappo_model_path)
+    summaries = evaluate_all_policies(scenario.config, args.seeds, model_path, mappo_model_path)
 
-    print(f"Evaluated on {len(args.seeds)} held-out test seeds: {args.seeds}\n")
+    print(f"Scenario {scenario.name!r}: evaluated on {len(args.seeds)} held-out test seeds: {args.seeds}\n")
     print_comparison_table(summaries)
     print("\navg_wait includes (delay): time EVs stood waiting for a decision (MAPPO's decision window).")
 
-    RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    RESULTS_PATH.write_text(json.dumps({"seeds": args.seeds, "policies": summaries}, indent=2))
-    print(f"\nsaved full results to {RESULTS_PATH}")
+    # The default scenario keeps the original results file.
+    results_path = RESULTS_PATH if scenario.name == DEFAULT_SCENARIO else RESULTS_PATH.with_stem(
+        f"{RESULTS_PATH.stem}_{scenario.name}"
+    )
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    results_path.write_text(
+        json.dumps({"scenario": scenario.name, "seeds": args.seeds, "policies": summaries}, indent=2)
+    )
+    print(f"\nsaved full results to {results_path}")
+
+
+def _existing_or_none(path: Path, name: str, train_module: str) -> Path | None:
+    if path.exists():
+        return path
+    print(
+        f"WARNING: no {name} model at {path} -- {name} is left out of this comparison. "
+        f"Train one with `python -m backend.ai_core.{train_module} --scenario ...`.\n"
+    )
+    return None
 
 
 if __name__ == "__main__":

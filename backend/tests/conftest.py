@@ -93,3 +93,6 @@ def mock_osm_fetch(monkeypatch):
     monkeypatch.setattr(
         network_graph, "_load_or_fetch_osm_graph", lambda config: fake_graph.copy()
     )
+    monkeypatch.setattr(
+        network_graph, "_load_or_fetch_road_layer_graph", lambda config: fake_graph.copy()
+    )

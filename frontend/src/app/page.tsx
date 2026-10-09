@@ -5,19 +5,23 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   fetchMyCarPreview,
   fetchNetworkInfo,
+  fetchScenarios,
   fetchStatus,
   pauseSimulation,
   resetSimulation,
   resumeSimulation,
   setSimulationSpeed,
   startSimulation,
+  switchScenario,
 } from "@/lib/api";
 import { useSimulationSocket } from "@/lib/websocket";
 import type {
-  Algorithm,
   MyCarPreviewResponse,
   NetworkInfo,
+  ScenarioInfo,
+  ScenarioName,
   SimulationStatusResponse,
+  StartSimulationRequest,
 } from "@/lib/types";
 import ControlPanel from "@/components/ControlPanel";
 import DashboardCharts from "@/components/DashboardCharts";
@@ -32,6 +36,8 @@ const STATUS_POLL_INTERVAL_MS = 1000;
 export default function Home() {
   const [network, setNetwork] = useState<NetworkInfo | null>(null);
   const [status, setStatus] = useState<SimulationStatusResponse | null>(null);
+  const [scenarios, setScenarios] = useState<ScenarioInfo[]>([]);
+  const [switchingScenario, setSwitchingScenario] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [selectedStationId, setSelectedStationId] = useState<number | null>(null);
   const [myCarPreview, setMyCarPreview] = useState<MyCarPreviewResponse | null>(null);
@@ -40,10 +46,28 @@ export default function Home() {
   const { snapshot, connectionState } = useSimulationSocket();
 
   useEffect(() => {
-    fetchNetworkInfo()
-      .then(setNetwork)
+    fetchScenarios()
+      .then(setScenarios)
       .catch((err) => setErrorMessage(String(err)));
   }, []);
+
+  // The static network belongs to one scenario and one episode seed
+  // (station/depot positions are drawn per seed), so it is re-fetched
+  // whenever the backend reports a different pair -- including a scenario
+  // switch made from another browser tab.
+  const networkKey = status ? `${status.scenario}:${status.episode_seed}` : null;
+  useEffect(() => {
+    if (networkKey === null) return;
+    let cancelled = false;
+    fetchNetworkInfo()
+      .then((next) => {
+        if (!cancelled) setNetwork(next);
+      })
+      .catch((err) => setErrorMessage(String(err)));
+    return () => {
+      cancelled = true;
+    };
+  }, [networkKey]);
 
   const refreshStatus = useCallback(() => {
     fetchStatus()
@@ -70,6 +94,16 @@ export default function Home() {
       }
     },
     [],
+  );
+
+  const handleScenarioChange = useCallback(
+    async (scenario: ScenarioName) => {
+      setSwitchingScenario(true);
+      setSelectedStationId(null);
+      await withErrorHandling(() => switchScenario(scenario));
+      setSwitchingScenario(false);
+    },
+    [withErrorHandling],
   );
 
   const vehicles = useMemo(() => snapshot?.vehicles ?? [], [snapshot]);
@@ -135,10 +169,11 @@ export default function Home() {
         <div className="flex flex-col gap-4">
           <ControlPanel
             status={status}
+            scenarios={scenarios}
+            switchingScenario={switchingScenario}
+            onScenarioChange={handleScenarioChange}
             errorMessage={errorMessage}
-            onStart={(params: { seed?: number; algorithm: Algorithm; speed: number }) =>
-              withErrorHandling(() => startSimulation(params))
-            }
+            onStart={(params: StartSimulationRequest) => withErrorHandling(() => startSimulation(params))}
             onPause={() => withErrorHandling(pauseSimulation)}
             onResume={() => withErrorHandling(resumeSimulation)}
             onReset={(seed?: number) => withErrorHandling(() => resetSimulation(seed))}

@@ -1,13 +1,20 @@
 """MAPPO training entry point.
 
 Trains a shared Actor + centralized Critic (backend/ai_core/mappo.py) on
-MultiAgentEVEnv with OSM_DEMO_CONFIG and a 15-tick decision window, and
-saves the best model (by validation reward) to models/mappo_osm_model.pth,
-the path backend/api/simulation_manager.py loads.
+MultiAgentEVEnv with one scenario's config (backend/config.SCENARIOS) and a
+15-tick decision window, and saves the best model (by validation reward) to
+that scenario's mappo_model_path, the file backend/api/simulation_manager.py
+loads for it:
+    --scenario small (default): OSM_DEMO_CONFIG -> models/mappo_osm_model.pth
+    --scenario large:           OSM_LARGE_CONFIG -> models/mappo_large_model.pth
+Network width, minibatch size and episodes per update default to the
+scenario's own values; the input/output widths always follow its
+num_stations (dispatch_core.observation_dim / state_dim).
 
 Run (from the repo root):
     python backend/ai_core/train_mappo.py --smoke-test
     python backend/ai_core/train_mappo.py                       # 300k decisions (default)
+    python backend/ai_core/train_mappo.py --scenario large      # 20 stations / 200 EVs
     python backend/ai_core/train_mappo.py --n-workers 2         # fewer parallel workers
     tensorboard --logdir ./logs/
 
@@ -49,7 +56,7 @@ from torch import nn
 
 from backend.ai_core.mappo import DEFAULT_HIDDEN_SIZES, MAPPOAgent
 from backend.ai_core.marl_env import MultiAgentEVEnv
-from backend.config import OSM_DEMO_CONFIG, SimulationConfig
+from backend.config import DEFAULT_SCENARIO, OSM_DEMO_CONFIG, SCENARIOS, SimulationConfig, get_scenario
 
 DECISION_WINDOW = 15
 # Parallel rollout processes; each loads its own copy of the OSM graph, as
@@ -57,7 +64,7 @@ DECISION_WINDOW = 15
 N_WORKERS = 4
 MODELS_DIR = Path("models")
 TENSORBOARD_LOG_DIR = Path("logs")
-DEFAULT_OUTPUT_PATH = MODELS_DIR / "mappo_osm_model.pth"
+DEFAULT_OUTPUT_PATH = Path(SCENARIOS[DEFAULT_SCENARIO].mappo_model_path)
 # Fixed scenarios the best model is picked on. Disjoint from
 # evaluate.TEST_SEEDS (1000-1004), which stay unseen for the final A/B test.
 VALIDATION_SEEDS = [2000, 2001, 2002, 2003, 2004]
@@ -118,10 +125,8 @@ def run_episode(env: MultiAgentEVEnv, agent: MAPPOAgent, seed: int, deterministi
     batches: list[DecisionBatch] = []
     stats = EpisodeStats()
     while env.agents:
-        agents = list(env.agents)
         global_state = env.state()
-        obs_batch = np.stack([obs[a] for a in agents])
-        actions, log_probs = agent.get_action(obs_batch, deterministic=deterministic)
+        agents, obs_batch, actions, log_probs = agent.act(env, obs, deterministic=deterministic)
         obs, rewards, _, _, infos = env.step(dict(zip(agents, actions.tolist())))
 
         reward_batch = np.array([rewards[a] for a in agents], dtype=np.float32)
@@ -150,9 +155,9 @@ def _worker_init(config: SimulationConfig, decision_window: int) -> None:
     _worker_env = MultiAgentEVEnv(config, decision_window=decision_window)
 
 
-def _worker_run(job: tuple[dict, int, int, int, list[int], int, bool]) -> Episode:
-    actor_state, obs_dim, state_dim, num_actions, hidden_sizes, seed, deterministic = job
-    agent = MAPPOAgent(obs_dim, state_dim, num_actions, hidden_sizes)
+def _worker_run(job: tuple[dict, int, int, int, list[int], bool, int, bool]) -> Episode:
+    actor_state, obs_dim, state_dim, num_actions, hidden_sizes, sequential, seed, deterministic = job
+    agent = MAPPOAgent(obs_dim, state_dim, num_actions, hidden_sizes, sequential_decisions=sequential)
     agent.actor.load_state_dict(actor_state)
     return run_episode(_worker_env, agent, seed, deterministic)
 
@@ -176,7 +181,9 @@ class RolloutRunner:
         if self._pool is None:
             return [run_episode(self._env, agent, seed, deterministic) for seed in seeds]
         actor_state = {k: v.cpu() for k, v in agent.actor.state_dict().items()}
-        dims = (agent.obs_dim, agent.state_dim, agent.num_actions, list(agent.hidden_sizes))
+        dims = (
+            agent.obs_dim, agent.state_dim, agent.num_actions, list(agent.hidden_sizes), agent.sequential_decisions
+        )
         return self._pool.map(_worker_run, [(actor_state, *dims, seed, deterministic) for seed in seeds])
 
     def close(self) -> None:
@@ -304,10 +311,14 @@ def summarize(episodes: list[Episode]) -> dict[str, float]:
     }
 
 
-def build_agent(config: SimulationConfig, hidden_sizes) -> MAPPOAgent:
+def build_agent(config: SimulationConfig, hidden_sizes, sequential_decisions: bool = False) -> MAPPOAgent:
     env = MultiAgentEVEnv(config)
     return MAPPOAgent(
-        env.observation_space(0).shape[0], env.state_space.shape[0], env.action_space(0).n, hidden_sizes
+        env.observation_space(0).shape[0],
+        env.state_space.shape[0],
+        env.action_space(0).n,
+        hidden_sizes,
+        sequential_decisions=sequential_decisions,
     )
 
 
@@ -324,10 +335,11 @@ def train(
     eval_every: int = 10,
     validation_seeds: list[int] = VALIDATION_SEEDS,
     tensorboard: bool = True,
+    sequential_decisions: bool = False,
 ) -> Path:
     torch.manual_seed(seed)
     seed_rng = np.random.default_rng(seed)
-    agent = build_agent(config, hidden_sizes)
+    agent = build_agent(config, hidden_sizes, sequential_decisions)
     optimizer = torch.optim.Adam(
         [*agent.actor.parameters(), *agent.critic.parameters()], lr=ppo.learning_rate, eps=1e-5
     )
@@ -343,7 +355,8 @@ def train(
     started = time.time()
     print(
         f"MAPPO: obs_dim={agent.obs_dim} state_dim={agent.state_dim} actions={agent.num_actions} "
-        f"window={decision_window} workers={n_workers} episodes/update={episodes_per_update}"
+        f"window={decision_window} sequential={agent.sequential_decisions} workers={n_workers} "
+        f"episodes/update={episodes_per_update}"
     )
     try:
         while decisions_done < total_decisions:
@@ -401,13 +414,19 @@ def train(
     return output_path
 
 
-def run_smoke_test(config: SimulationConfig, seed: int, n_workers: int) -> None:
+def run_smoke_test(
+    config: SimulationConfig,
+    seed: int,
+    n_workers: int,
+    hidden_sizes=DEFAULT_HIDDEN_SIZES,
+    sequential_decisions: bool = False,
+) -> None:
     from pettingzoo.test import parallel_api_test
 
     print("[1/3] checking environment (PettingZoo parallel API)...")
     parallel_api_test(MultiAgentEVEnv(config, decision_window=DECISION_WINDOW), num_cycles=1000)
 
-    smoke_path = MODELS_DIR / "checkpoints" / "mappo_smoke_test.pth"
+    smoke_path = MODELS_DIR / "checkpoints" / f"mappo_smoke_test_{config.num_stations}st.pth"
     print(f"[2/3] training one short update ({n_workers} workers)...")
     train(
         config,
@@ -416,6 +435,8 @@ def run_smoke_test(config: SimulationConfig, seed: int, n_workers: int) -> None:
         episodes_per_update=max(n_workers, 2),
         n_workers=n_workers,
         output_path=smoke_path,
+        hidden_sizes=hidden_sizes,
+        sequential_decisions=sequential_decisions,
         eval_every=1,
         validation_seeds=VALIDATION_SEEDS[:2],
         tensorboard=False,
@@ -431,34 +452,51 @@ def run_smoke_test(config: SimulationConfig, seed: int, n_workers: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train MAPPO for multi-agent EV charging-station dispatch.")
+    parser.add_argument("--scenario", choices=sorted(SCENARIOS), default=DEFAULT_SCENARIO,
+                        help="Which config to train on; also picks the default output file and network sizes.")
     parser.add_argument("--smoke-test", action="store_true", help="Run quick pre-training checks instead of full training.")
     parser.add_argument("--total-decisions", type=int, default=300_000)
-    parser.add_argument("--episodes-per-update", type=int, default=32)
+    parser.add_argument("--episodes-per-update", type=int, default=None, help="Default: the scenario's.")
     parser.add_argument("--n-workers", type=int, default=N_WORKERS, help="Parallel rollout processes.")
     parser.add_argument("--seed", type=int, default=OSM_DEMO_CONFIG.random_seed)
-    parser.add_argument("--hidden-sizes", type=int, nargs="+", default=list(DEFAULT_HIDDEN_SIZES))
+    parser.add_argument("--hidden-sizes", type=int, nargs="+", default=None, help="Default: the scenario's.")
+    parser.add_argument("--minibatch-size", type=int, default=None, help="Default: the scenario's.")
     parser.add_argument("--decision-window", type=int, default=DECISION_WINDOW)
     parser.add_argument("--eval-every", type=int, default=10, help="Updates between validation runs.")
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_PATH)
+    parser.add_argument("--output", type=Path, default=None, help="Default: the scenario's mappo_model_path.")
     parser.add_argument("--learning-rate", type=float, default=PPOConfig.learning_rate)
     parser.add_argument("--entropy-coef", type=float, default=PPOConfig.entropy_coef)
+    parser.add_argument("--sequential-decisions", action=argparse.BooleanOptionalAction, default=None,
+                        help="Agents of a batch decide one at a time. Default: the scenario's.")
     args = parser.parse_args()
 
+    scenario = get_scenario(args.scenario)
+    hidden_sizes = args.hidden_sizes or list(scenario.mappo_hidden_sizes)
+    sequential = (
+        scenario.mappo_sequential_decisions if args.sequential_decisions is None else args.sequential_decisions
+    )
+    print(f"scenario={scenario.name} ({scenario.label})")
+
     if args.smoke_test:
-        run_smoke_test(OSM_DEMO_CONFIG, args.seed, args.n_workers)
+        run_smoke_test(scenario.config, args.seed, args.n_workers, hidden_sizes, sequential)
         return
 
     train(
-        OSM_DEMO_CONFIG,
+        scenario.config,
         args.seed,
         total_decisions=args.total_decisions,
-        episodes_per_update=args.episodes_per_update,
+        episodes_per_update=args.episodes_per_update or scenario.mappo_episodes_per_update,
         n_workers=args.n_workers,
-        output_path=args.output,
-        ppo=PPOConfig(learning_rate=args.learning_rate, entropy_coef=args.entropy_coef),
-        hidden_sizes=args.hidden_sizes,
+        output_path=args.output or Path(scenario.mappo_model_path),
+        ppo=PPOConfig(
+            learning_rate=args.learning_rate,
+            entropy_coef=args.entropy_coef,
+            minibatch_size=args.minibatch_size or scenario.mappo_minibatch_size,
+        ),
+        hidden_sizes=hidden_sizes,
         decision_window=args.decision_window,
         eval_every=args.eval_every,
+        sequential_decisions=sequential,
     )
 
 

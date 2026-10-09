@@ -37,6 +37,7 @@ _TOTAL_POI_COUNT = DEFAULT_CONFIG.num_stations + DEFAULT_CONFIG.num_depots
 # lets test_load_or_fetch_osm_graph_caches_to_disk_on_first_call restore the
 # real implementation for itself.
 _REAL_LOAD_OR_FETCH_OSM_GRAPH = network_graph._load_or_fetch_osm_graph
+_REAL_LOAD_OR_FETCH_ROAD_LAYER_GRAPH = network_graph._load_or_fetch_road_layer_graph
 
 
 def test_build_network_is_connected_with_correct_station_and_depot_count():
@@ -328,3 +329,77 @@ def test_load_or_fetch_osm_graph_caches_to_disk_on_first_call(tmp_path, monkeypa
     second = network_graph._load_or_fetch_osm_graph(config)
     assert len(fetch_calls) == 1  # not re-fetched: loaded from the on-disk cache
     assert second.number_of_nodes() == fake_graph.number_of_nodes()
+
+
+def test_highway_class_picks_the_most_important_known_class():
+    assert network_graph.highway_class("residential") == "residential"
+    assert network_graph.highway_class(["residential", "primary"]) == "primary"
+    # A list saved to GraphML comes back as its string repr.
+    assert network_graph.highway_class("['service', 'tertiary']") == "tertiary"
+    assert network_graph.highway_class(None) == network_graph.DEFAULT_HIGHWAY_CLASS
+    assert network_graph.highway_class("bogus") == network_graph.DEFAULT_HIGHWAY_CLASS
+
+
+def test_routing_edges_carry_a_highway_class_and_spurs_are_marked():
+    graph = network_graph.build_network(DEFAULT_CONFIG, seed=1)
+    poi_nodes = set(network_graph.get_station_nodes(graph)) | set(network_graph.get_depot_nodes(graph))
+
+    for u, v, data in graph.edges(data=True):
+        if u in poi_nodes or v in poi_nodes:
+            assert data["highway"] == network_graph.SPUR_HIGHWAY_CLASS
+        else:
+            assert data["highway"] in network_graph.HIGHWAY_CLASSES
+
+
+def test_road_layer_has_one_segment_per_street_in_lat_lng():
+    raw = fake_osm_multidigraph()
+    roads = network_graph.build_road_layer(DEFAULT_CONFIG)
+
+    # Both travel directions of a street collapse into one segment; the
+    # extra parallel edge (key 99) is a distinct segment.
+    undirected = {(min(u, v), max(u, v), k) for u, v, k in raw.edges(keys=True)}
+    assert len(roads) == len(undirected)
+    for road in roads:
+        assert road["highway"] in network_graph.HIGHWAY_CLASSES
+        assert len(road["geometry"]) >= 2
+        lat, lng = road["geometry"][0]
+        assert 20 < lat < 22 and 105 < lng < 106
+
+
+def test_full_drive_routing_graph_uses_the_full_filter_and_shares_the_road_layer_cache(tmp_path, monkeypatch):
+    import osmnx as ox
+
+    monkeypatch.setattr(network_graph, "_load_or_fetch_osm_graph", _REAL_LOAD_OR_FETCH_OSM_GRAPH)
+    monkeypatch.setattr(network_graph, "_load_or_fetch_road_layer_graph", _REAL_LOAD_OR_FETCH_ROAD_LAYER_GRAPH)
+    cache_path = str(tmp_path / "large.graphml")
+    config = replace(
+        DEFAULT_CONFIG, osm_full_drive_network=True, osm_cache_path=cache_path, osm_road_layer_cache_path=cache_path
+    )
+    fetch_kwargs = []
+    monkeypatch.setattr(
+        ox, "graph_from_point", lambda point, **kwargs: (fetch_kwargs.append(kwargs), fake_osm_multidigraph())[1]
+    )
+
+    network_graph._load_or_fetch_osm_graph(config)
+    network_graph._load_or_fetch_road_layer_graph(config)
+
+    assert len(fetch_kwargs) == 1  # the road layer reused the routing graph's file
+    assert fetch_kwargs[0]["custom_filter"] == network_graph.FULL_DRIVE_FILTER
+    assert fetch_kwargs[0]["retain_all"] is True
+    for excluded in ("footway", "pedestrian", "steps", "path"):
+        assert excluded in network_graph.FULL_DRIVE_FILTER
+    assert "service" not in network_graph.FULL_DRIVE_FILTER.split('["service"')[0]
+
+
+def test_shortest_path_to_a_poi_matches_a_direct_search():
+    graph = build_network(DEFAULT_CONFIG, seed=4)
+
+    for target in get_station_nodes(graph) + get_depot_nodes(graph):
+        for source in list(graph.nodes())[::7]:
+            path, distance, travel_time = shortest_path(graph, source, target)
+            expected = nx.shortest_path(graph, source, target, weight="travel_time")
+            assert path[0] == source and path[-1] == target
+            assert all(graph.has_edge(u, v) for u, v in zip(path, path[1:]))
+            assert travel_time == pytest.approx(
+                sum(graph.edges[u, v]["travel_time"] for u, v in zip(expected, expected[1:]))
+            )

@@ -138,6 +138,15 @@ class SimulationConfig:
     osm_center_lng: float = 105.7973
     osm_radius_meters: float = 1000.0
     osm_cache_path: str = "data/osm_nghia_do.graphml"
+    # Display-only layer of every drivable street in the same extract
+    # (network_graph.build_road_layer); never used for routing.
+    osm_road_layer_cache_path: str = "data/osm_nghia_do_roads.graphml"
+    # False: the routing graph is osmnx's "drive" network (main roads only,
+    # no `service` alleys). True: it is every street a car can enter
+    # (network_graph.FULL_DRIVE_FILTER: tertiary, residential, unclassified,
+    # service, living_street, ...; never footways/pedestrian/steps), the
+    # same set the display road layer shows.
+    osm_full_drive_network: bool = False
 
     # --- Station/depot POI (spatial-geometry refactor). A station/depot is
     # not itself a traffic node: it is a small POI node connected to one
@@ -199,3 +208,94 @@ OSM_DEMO_CONFIG = replace(
     peak_hour_fraction=0.6,
     non_app_fraction=0.2,
 )
+
+# Scale-up scenario (phase 2): same center, 2x the radius (4x the area), 4x
+# the EVs and 2x the stations, so stations are scarcer per EV and more
+# contested than in OSM_DEMO_CONFIG.
+# The routing graph is the full drivable network (alleys included) in its
+# own cache file -- the small scenario's files are never touched. Cohort
+# fractions (peak hour / late joiners / non-app) are unchanged.
+# Battery recalibrated for the wider map the same way OSM_DEMO_CONFIG was
+# (under nearest_station, no EV may be stranded purely by the environment):
+# - battery_consumption_per_distance 1/8000: a full battery covers ~8 km.
+# - low_battery_threshold 0.8: an EV asks for a station with ~6.4 km of
+#   range left. Over 30 seeds the farthest any road node sits from its
+#   nearest of the 10 stations is up to ~4.1 km of real road, so this
+#   leaves a ~1.56x margin (the small map's 0.75 leaves ~1.24x), headroom
+#   for the wider map's longer detours and MAPPO's decision-window idle
+#   drain. nearest_station on 30 seeds: 0 stranded / 0 failed, ~148
+#   decisions per 200-EV episode, every episode done by ~10.4k ticks
+#   (max_episode_steps 20000 is kept).
+OSM_LARGE_CONFIG = replace(
+    OSM_DEMO_CONFIG,
+    num_stations=10,
+    num_vehicles=200,
+    num_depots=12,
+    max_num_stations=30,
+    max_num_vehicles=300,
+    battery_consumption_per_distance=1.0 / 8000.0,
+    low_battery_threshold=0.8,
+    osm_radius_meters=2000.0,
+    osm_full_drive_network=True,
+    # One extract serves both routing and display (same filter).
+    osm_cache_path="data/osm_nghia_do_large.graphml",
+    osm_road_layer_cache_path="data/osm_nghia_do_large.graphml",
+)
+
+
+@dataclass(frozen=True)
+class Scenario:
+    """One selectable deployment: a simulation config plus the trained
+    model files and training sizes that belong to it. The API serves any
+    registered scenario, and train_mappo.py / train.py take `--scenario`."""
+
+    name: str
+    label: str
+    config: SimulationConfig
+    mappo_model_path: str
+    dqn_model_path: str
+    # MAPPO network/training sizes (train_mappo.py defaults for this scenario).
+    mappo_hidden_sizes: tuple[int, ...] = (64, 64)
+    mappo_minibatch_size: int = 256
+    mappo_episodes_per_update: int = 32
+    # Agents of one decision batch choose one at a time, each seeing the
+    # earlier picks (MAPPOAgent.sequential_decisions). Off for "small",
+    # whose served model was trained deciding a batch all at once.
+    mappo_sequential_decisions: bool = False
+
+
+SCENARIOS: dict[str, Scenario] = {
+    # Phase 1, unchanged: the demo's safe fallback.
+    "small": Scenario(
+        name="small",
+        label="Mô hình Nhỏ (5 Trạm - An toàn)",
+        config=OSM_DEMO_CONFIG,
+        mappo_model_path="models/mappo_osm_model.pth",
+        dqn_model_path="models/dqn_osm_model.zip",
+    ),
+    # A large episode has ~4x the decisions of a small one, so fewer
+    # episodes already fill a bigger minibatch; the wider network learns
+    # a 4x busier, more contested scenario.
+    "large": Scenario(
+        name="large",
+        label="Mô hình Lớn (10 Trạm - Thử nghiệm)",
+        config=OSM_LARGE_CONFIG,
+        mappo_model_path="models/mappo_large_model.pth",
+        dqn_model_path="models/dqn_large_model.zip",
+        mappo_hidden_sizes=(256, 256),
+        mappo_minibatch_size=1024,
+        mappo_episodes_per_update=16,
+        # 200 EVs often run low together; deciding a batch at once from the
+        # same observations sent them all to the same station (argmax: ~60%
+        # of dispatches overloaded on the test seeds).
+        mappo_sequential_decisions=True,
+    ),
+}
+DEFAULT_SCENARIO = "small"
+
+
+def get_scenario(name: str) -> Scenario:
+    try:
+        return SCENARIOS[name]
+    except KeyError:
+        raise ValueError(f"unknown scenario {name!r}; expected one of {sorted(SCENARIOS)}") from None

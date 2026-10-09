@@ -12,12 +12,15 @@ decision batch with a single agent is just a batch of size 1.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
 import torch
 from torch import nn
 from torch.distributions import Categorical
+
+if TYPE_CHECKING:
+    from backend.ai_core.marl_env import MultiAgentEVEnv
 
 DEFAULT_HIDDEN_SIZES = (64, 64)
 
@@ -72,6 +75,7 @@ class MAPPOAgent:
         num_actions: int,
         hidden_sizes: Sequence[int] = DEFAULT_HIDDEN_SIZES,
         device: str | torch.device = "cpu",
+        sequential_decisions: bool = False,
     ):
         # Plain ints (gymnasium's Discrete.n is a numpy int), so a saved
         # checkpoint loads with torch.load(weights_only=True).
@@ -79,6 +83,12 @@ class MAPPOAgent:
         self.state_dim = int(state_dim)
         self.num_actions = int(num_actions)
         self.hidden_sizes = tuple(int(size) for size in hidden_sizes)
+        # How act() decides a batch: all agents at once from the same
+        # observations (False), or one at a time, each seeing the earlier
+        # picks of its batch (MultiAgentEVEnv.decide_sequentially). Saved
+        # with the weights, so a model is always served the way it was
+        # trained; checkpoints without it decide all at once.
+        self.sequential_decisions = bool(sequential_decisions)
         self.device = torch.device(device)
         self.actor = Actor(self.obs_dim, self.num_actions, self.hidden_sizes).to(self.device)
         self.critic = Critic(self.state_dim, self.hidden_sizes).to(self.device)
@@ -96,6 +106,32 @@ class MAPPOAgent:
         dist = self._distribution(self._as_batch(obs, self.obs_dim))
         actions = dist.probs.argmax(dim=-1) if deterministic else dist.sample()
         return actions.cpu().numpy(), dist.log_prob(actions).cpu().numpy()
+
+    def act(
+        self, env: MultiAgentEVEnv, observations: dict[int, np.ndarray], deterministic: bool = False
+    ) -> tuple[list[int], np.ndarray, np.ndarray, np.ndarray]:
+        """Actions for every agent of env's current batch, decided as
+        self.sequential_decisions says. `observations` is what env.reset()/
+        step() returned (used only when deciding all at once). Returns
+        (agents, the observations the actions were chosen from, actions,
+        log_probs), all in env.agents order -- for training, the chosen-from
+        observations are what the policy must be credited for."""
+        agents = list(env.agents)
+        if not self.sequential_decisions:
+            obs_batch = np.stack([observations[agent] for agent in agents])
+            actions, log_probs = self.get_action(obs_batch, deterministic=deterministic)
+            return agents, obs_batch, actions, log_probs
+
+        log_probs: list[float] = []
+
+        def choose(observation: np.ndarray) -> int:
+            action, log_prob = self.get_action(observation, deterministic=deterministic)
+            log_probs.append(float(log_prob[0]))
+            return int(action[0])
+
+        chosen, obs_batch = env.decide_sequentially(choose)
+        actions = np.array([chosen[agent] for agent in agents], dtype=np.int64)
+        return agents, obs_batch, actions, np.array(log_probs, dtype=np.float32)
 
     @torch.no_grad()
     def get_value(self, global_state: np.ndarray) -> np.ndarray:
@@ -127,6 +163,7 @@ class MAPPOAgent:
                 "state_dim": self.state_dim,
                 "num_actions": self.num_actions,
                 "hidden_sizes": list(self.hidden_sizes),
+                "sequential_decisions": self.sequential_decisions,
                 "actor": self.actor.state_dict(),
                 "critic": self.critic.state_dict(),
                 "metadata": metadata,
@@ -143,6 +180,7 @@ class MAPPOAgent:
             checkpoint["num_actions"],
             checkpoint["hidden_sizes"],
             device=device,
+            sequential_decisions=checkpoint.get("sequential_decisions", False),
         )
         agent.actor.load_state_dict(checkpoint["actor"])
         agent.critic.load_state_dict(checkpoint["critic"])

@@ -1,12 +1,12 @@
 "use client";
 
-// Control panel (PROJECT_SPEC.md section 38): Start, Pause, Reset, Algorithm
-// selection, Simulation speed. Sends control requests to the backend only --
+// Control panel (PROJECT_SPEC.md section 38): Scenario, Start, Pause, Reset,
+// Algorithm selection, Simulation speed. Sends control requests to the backend only --
 // no RL decision or simulation logic lives here (section 39).
 
 import { useState } from "react";
 import { Pause, Play, RotateCcw } from "lucide-react";
-import type { Algorithm, SimulationStatusResponse } from "@/lib/types";
+import type { Algorithm, ScenarioInfo, ScenarioName, SimulationStatusResponse } from "@/lib/types";
 
 const ALGORITHMS: { value: Algorithm; label: string }[] = [
   { value: "nearest_station", label: "Nearest Station" },
@@ -18,6 +18,10 @@ const ALGORITHMS: { value: Algorithm; label: string }[] = [
 
 interface ControlPanelProps {
   status: SimulationStatusResponse | null;
+  scenarios: ScenarioInfo[];
+  // True while a scenario switch (map + config + models) is in flight.
+  switchingScenario: boolean;
+  onScenarioChange: (scenario: ScenarioName) => void;
   onStart: (params: { seed?: number; algorithm: Algorithm; speed: number }) => void;
   onPause: () => void;
   onResume: () => void;
@@ -28,6 +32,9 @@ interface ControlPanelProps {
 
 export default function ControlPanel({
   status,
+  scenarios,
+  switchingScenario,
+  onScenarioChange,
   onStart,
   onPause,
   onResume,
@@ -40,6 +47,10 @@ export default function ControlPanel({
   const [speed, setSpeed] = useState(status?.speed ?? 5);
 
   const parsedSeed = seedInput.trim() === "" ? undefined : Number(seedInput);
+  const activeScenario = scenarios.find((s) => s.name === status?.scenario);
+  const missingModels = activeScenario
+    ? [!activeScenario.has_mappo_model && "MAPPO", !activeScenario.has_dqn_model && "DQN"].filter(Boolean)
+    : [];
 
   return (
     <div className="flex flex-col gap-3 rounded-lg border border-gray-200 bg-white p-3 dark:border-gray-800 dark:bg-gray-900">
@@ -56,8 +67,38 @@ export default function ControlPanel({
           {status?.status ?? "loading…"}
         </span>
         <span className="text-xs text-gray-500 dark:text-gray-400">
-          t = {(status?.simulation_time ?? 0).toFixed(0)}s · seed {status?.episode_seed ?? "—"}
+          t = {(status?.simulation_time ?? 0).toFixed(0)}s · seed {status?.episode_seed ?? "—"} ·{" "}
+          {status?.algorithm ?? "—"}
         </span>
+      </div>
+
+      <div className="flex flex-col gap-1">
+        <label className="text-xs font-medium text-gray-500 dark:text-gray-400">
+          Scenario (Kịch bản)
+        </label>
+        <select
+          value={status?.scenario ?? ""}
+          disabled={switchingScenario || scenarios.length === 0}
+          onChange={(e) => onScenarioChange(e.target.value)}
+          className="rounded-md border border-gray-300 bg-white px-2 py-1 text-sm disabled:opacity-60 dark:border-gray-700 dark:bg-gray-800"
+        >
+          {scenarios.map((option) => (
+            <option key={option.name} value={option.name}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+        {switchingScenario ? (
+          <span className="text-xs text-gray-500 dark:text-gray-400">Đang tải bản đồ…</span>
+        ) : (
+          activeScenario && (
+            <span className="text-xs text-gray-500 dark:text-gray-400">
+              {activeScenario.num_stations} trạm · {activeScenario.num_vehicles} xe ·{" "}
+              {activeScenario.num_depots} bãi đỗ · bán kính {(activeScenario.radius_meters / 1000).toFixed(1)} km
+              {missingModels.length > 0 && ` · chưa có model ${missingModels.join(", ")}`}
+            </span>
+          )
+        )}
       </div>
 
       <div className="flex flex-col gap-1">

@@ -28,7 +28,11 @@ their own timing.
 
 Within a batch, EVs are dispatched in vehicle_id order, so a later EV's
 expected waiting time already counts the EVs of the same batch sent to that
-station before it.
+station before it. The observations step() and reset() return are all taken
+before any of the batch is dispatched, so agents choosing from them at once
+cannot see each other's picks and, on a busy map, tend to all pick the same
+station. decide_sequentially() lets them choose one at a time instead, each
+seeing the earlier picks of its batch as EVs already driving there.
 
 For MAPPO's centralized critic (CTDE), state() returns every station's load
 plus the episode's time progress (see DispatchContext.global_state); each
@@ -175,6 +179,37 @@ class MultiAgentEVEnv(ParallelEnv):
         for info in infos.values():
             info["simulation_time"] = self.simulator.simulation_time
         return observations, rewards, terminations, truncations, infos
+
+    def decide_sequentially(self, choose: Callable[[np.ndarray], int]) -> tuple[dict[int, int], np.ndarray]:
+        """Pick an action for every agent of the current batch one at a
+        time, in the order step() dispatches them: each agent's observation
+        counts the agents before it as already driving to the stations they
+        picked (station.incoming_count), which is exactly what step() will
+        then make true. The reservations are undone before returning, so the
+        env is unchanged; pass the actions to step() to dispatch them.
+        (An invalid pick is redirected by step() to the nearest reachable
+        station; later agents saw it reserved at the requested one.)
+        Returns (actions, the observation each agent chose from, stacked in
+        self.agents order)."""
+        assert self._context is not None, "call reset() before decide_sequentially()"
+        actions: dict[int, int] = {}
+        observations: list[np.ndarray] = []
+        reserved = []
+        try:
+            for agent in self.agents:
+                observation = self._context.build_observation(agent)
+                action = int(choose(observation))
+                if not self._action_space.contains(action):
+                    raise ValueError(f"action {action} for agent {agent} outside {self._action_space}")
+                station = self.simulator.stations[self.station_id_for_action(action)]
+                station.incoming_count += 1
+                reserved.append(station)
+                actions[agent] = action
+                observations.append(observation)
+        finally:
+            for station in reserved:
+                station.incoming_count -= 1
+        return actions, np.stack(observations) if observations else np.empty((0, *self._observation_space.shape))
 
     def state(self) -> np.ndarray:
         """Global state for the centralized critic: queue, available
