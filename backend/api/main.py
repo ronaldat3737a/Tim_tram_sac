@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.api.routes.gnn_eval import router as gnn_eval_router
+from backend.api.routes.sandbox import router as sandbox_router
 from backend.api.routes.simulation import router as simulation_router
 from backend.api.simulation_manager import SimulationManager
 from backend.api.websockets import router as websocket_router
@@ -64,6 +65,7 @@ def create_app(
 
     app.include_router(simulation_router)
     app.include_router(gnn_eval_router)
+    app.include_router(sandbox_router)
     app.include_router(websocket_router)
 
     @app.get("/")

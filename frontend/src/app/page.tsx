@@ -155,6 +155,12 @@ export default function Home() {
           >
             So sánh MLP vs GNN
           </Link>
+          <Link
+            href="/gnn-sandbox"
+            className="rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-800"
+          >
+            GNN Sandbox
+          </Link>
           <span
             className={`text-xs ${connectionState === "open" ? "text-emerald-600" : "text-gray-400"}`}
           >
