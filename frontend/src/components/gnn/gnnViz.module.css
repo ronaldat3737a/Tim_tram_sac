@@ -1,0 +1,29 @@
+/* Chart roles for the GNN comparison page. Accents validated (CVD, contrast)
+   against the app's card surfaces: white (light) and gray-900 (dark).
+   Heuristic baselines stay neutral so MAPPO-MLP vs MAPPO-GNN carries the
+   colour; each algorithm keeps its colour in every chart. */
+.vizRoot {
+  --surface-1: #ffffff;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --grid: #e7e5e4;
+  --axis: #a8a29e;
+  --series-heuristic: #a8a29e;
+  --series-mlp: #2a78d6;
+  --series-gnn: #eb6834;
+  --status-good: #0ca30c;
+  --status-critical: #d03b3b;
+}
+
+@media (prefers-color-scheme: dark) {
+  .vizRoot {
+    --surface-1: #111827;
+    --text-primary: #f0efec;
+    --text-secondary: #c3c2b7;
+    --grid: #2a2f3a;
+    --axis: #6b7280;
+    --series-heuristic: #6b7280;
+    --series-mlp: #3987e5;
+    --series-gnn: #d95926;
+  }
+}

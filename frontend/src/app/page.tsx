@@ -1,6 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
+import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   fetchMyCarPreview,
@@ -147,11 +148,19 @@ export default function Home() {
     <div className="mx-auto flex w-full max-w-[1600px] flex-1 flex-col gap-4 p-4">
       <header className="flex items-center justify-between">
         <h1 className="text-xl font-semibold">EV Charging Dispatch Dashboard</h1>
-        <span
-          className={`text-xs ${connectionState === "open" ? "text-emerald-600" : "text-gray-400"}`}
-        >
-          WebSocket: {connectionState}
-        </span>
+        <div className="flex items-center gap-3">
+          <Link
+            href="/gnn-comparison"
+            className="rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-800"
+          >
+            So sánh MLP vs GNN
+          </Link>
+          <span
+            className={`text-xs ${connectionState === "open" ? "text-emerald-600" : "text-gray-400"}`}
+          >
+            WebSocket: {connectionState}
+          </span>
+        </div>
       </header>
 
       <div className="grid flex-1 grid-cols-1 gap-4 lg:grid-cols-[1fr_280px_280px]">
